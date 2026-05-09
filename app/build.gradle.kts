@@ -40,6 +40,10 @@ android {
     buildFeatures {
         compose = true
     }
+
+    androidResources {
+        noCompress += "onnx"
+    }
 }
 
 dependencies {
@@ -56,4 +60,6 @@ dependencies {
 
     implementation("com.github.pedroSG94.RootEncoder:library:2.7.2")
     implementation("com.github.pedroSG94:RTSP-Server:1.4.1")
+
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 }

@@ -13,3 +13,16 @@
 *.aab
 /kotlin
 .kotlin
+
+# YOLO model export artifacts
+*.pt
+yolov8n.onnx
+calibration_*.npy
+
+# BLE snoop / reverse-engineering captures
+*.log
+parsed.txt
+bugreport.zip
+
+# Local agent state
+.claude/
