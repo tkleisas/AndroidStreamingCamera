@@ -3,14 +3,19 @@ package com.streamcam.app
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentUris
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import android.util.Log
 import android.util.Range
 import android.view.MotionEvent
@@ -77,6 +82,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
+import java.io.File
 
 private const val SHOW_GIMBAL_UI = false
 
@@ -91,6 +97,9 @@ class MainActivity : ComponentActivity() {
     private var detections = mutableStateOf<List<Detection>>(emptyList())
     private var isDetecting = mutableStateOf(false)
     private var detectionJob: Job? = null
+    private var lastRecordingUri: Uri? = null
+    private var lastRecordingName: String? = null
+    private var showRecordingsPicker = mutableStateOf(false)
 
     private var trackingClassId = -1
     private var trackingCx = 0f
@@ -131,6 +140,21 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val filePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            } catch (_: Exception) {}
+            val name = uri.lastPathSegment ?: "video.mp4"
+            openTrimmer(uri, name)
+        }
+    }
+
     private val backPressedCallback = object : OnBackPressedCallback(true) {
         override fun handleOnBackPressed() {
             if (isCurrentlyStreaming) {
@@ -165,6 +189,7 @@ class MainActivity : ComponentActivity() {
                 val currentTrackedIdx by remember { trackedIdx }
                 var backCameras by remember { mutableStateOf<List<CameraOption>>(emptyList()) }
                 var isRecording by remember { mutableStateOf(false) }
+                var showPicker by remember { showRecordingsPicker }
 
                 if (showDialog) {
                     ExitConfirmationDialog(
@@ -176,6 +201,22 @@ class MainActivity : ComponentActivity() {
                             finish()
                         },
                         onDismiss = { showDialog = false },
+                    )
+                }
+
+                if (showPicker) {
+                    val recordings = remember { getRecordings() }
+                    RecordingsListDialog(
+                        recordings = recordings,
+                        onSelect = { uri, name ->
+                            showPicker = false
+                            openTrimmer(uri, name)
+                        },
+                        onBrowseFiles = {
+                            showPicker = false
+                            filePickerLauncher.launch(arrayOf("video/*"))
+                        },
+                        onDismiss = { showPicker = false },
                     )
                 }
 
@@ -240,7 +281,9 @@ class MainActivity : ComponentActivity() {
                             val path = server.startRecording()
                             isRecording = path != null
                             if (path != null) {
-                                Toast.makeText(this@MainActivity, "Recording to ${path.substringAfterLast('/')}", Toast.LENGTH_SHORT).show()
+                                lastRecordingUri = server.getLastRecordingUri()
+                                lastRecordingName = path.substringAfterLast('/')
+                                Toast.makeText(this@MainActivity, "Recording to $lastRecordingName", Toast.LENGTH_SHORT).show()
                             } else {
                                 Toast.makeText(this@MainActivity, "Failed to start recording", Toast.LENGTH_SHORT).show()
                             }
@@ -256,6 +299,15 @@ class MainActivity : ComponentActivity() {
                     trackedIndex = currentTrackedIdx,
                     onDetectionTapped = if (detecting) { det -> onDetectionTapped(det) } else null,
                     isTracking = currentTrackedIdx >= 0,
+                    onAddMarker = { streamServer?.addMarker() },
+                    onOpenTrimmer = {
+                        val recordings = getRecordings()
+                        if (recordings.isNotEmpty()) {
+                            showRecordingsPicker.value = true
+                        } else {
+                            filePickerLauncher.launch(arrayOf("video/*"))
+                        }
+                    },
                 )
             }
         }
@@ -449,6 +501,50 @@ class MainActivity : ComponentActivity() {
         requiredPermissions.all {
             ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
         }
+
+    private fun openTrimmer(uri: Uri, name: String) {
+        val intent = Intent(this, VideoTrimmerActivity::class.java).apply {
+            putExtra("video_uri", uri.toString())
+            putExtra("video_name", name)
+        }
+        startActivity(intent)
+    }
+
+    private fun getRecordings(): List<Pair<Uri, String>> {
+        val out = mutableListOf<Pair<Uri, String>>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val projection = arrayOf(
+                MediaStore.Video.Media._ID,
+                MediaStore.Video.Media.DISPLAY_NAME,
+            )
+            val selection = "${MediaStore.Video.Media.RELATIVE_PATH} = ?"
+            val selectionArgs = arrayOf("DCIM/StreamCam/")
+            contentResolver.query(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                selection,
+                selectionArgs,
+                "${MediaStore.Video.Media.DATE_ADDED} DESC",
+            )?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idCol)
+                    val name = cursor.getString(nameCol)
+                    out.add(ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id) to name)
+                }
+            }
+        } else {
+            val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "StreamCam")
+            if (dir.exists()) {
+                dir.listFiles()
+                    ?.filter { it.extension.equals("mp4", ignoreCase = true) }
+                    ?.sortedByDescending { it.lastModified() }
+                    ?.forEach { out.add(Uri.fromFile(it) to it.name) }
+            }
+        }
+        return out
+    }
 }
 
 @Composable
@@ -468,6 +564,50 @@ fun ExitConfirmationDialog(
         dismissButton = {
             TextButton(onClick = onDismiss) {
                 Text("Continue Streaming")
+            }
+        },
+    )
+}
+
+@Composable
+fun RecordingsListDialog(
+    recordings: List<Pair<Uri, String>>,
+    onSelect: (Uri, String) -> Unit,
+    onBrowseFiles: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Choose a recording") },
+        text = {
+            Column {
+                if (recordings.isEmpty()) {
+                    Text("No recordings found", color = Color.White.copy(alpha = 0.6f))
+                } else {
+                    recordings.forEach { (uri, name) ->
+                        Text(
+                            text = name,
+                            color = Color(0xFF4FC3F7),
+                            fontSize = 14.sp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onSelect(uri, name) }
+                                .padding(vertical = 8.dp, horizontal = 4.dp),
+                        )
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                TextButton(
+                    onClick = onBrowseFiles,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Browse all files...", color = Color(0xFFFFB74D), fontSize = 14.sp)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = Color.White.copy(alpha = 0.6f))
             }
         },
     )
@@ -517,7 +657,9 @@ fun StreamingScreen(
     onTiltStop: () -> Unit = {},
     trackedIndex: Int = -1,
     onDetectionTapped: ((Detection) -> Unit)? = null,
-    isTracking: Boolean = false,
+                    isTracking: Boolean = false,
+    onAddMarker: () -> Unit = {},
+    onOpenTrimmer: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var isStreaming by remember { mutableStateOf(false) }
@@ -627,6 +769,8 @@ fun StreamingScreen(
                     onToggleGimbal = onToggleGimbal,
                     onTiltStart = onTiltStart,
                     onTiltStop = onTiltStop,
+                    onAddMarker = onAddMarker,
+                    onOpenTrimmer = onOpenTrimmer,
                 )
             }
         }
@@ -792,6 +936,8 @@ fun ControlBar(
     onToggleGimbal: () -> Unit = {},
     onTiltStart: (Int) -> Unit = {},
     onTiltStop: () -> Unit = {},
+    onAddMarker: () -> Unit = {},
+    onOpenTrimmer: () -> Unit = {},
 ) {
     var lensIndex by remember { mutableIntStateOf(0) }
     Row(
@@ -831,6 +977,19 @@ fun ControlBar(
             contentPadding = PaddingValues(16.dp),
         ) {
             Text(if (isRecording) "Stop Rec" else "Rec", color = Color.White, fontSize = 12.sp)
+        }
+
+        if (isRecording) {
+            Button(
+                onClick = onAddMarker,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFFFFB74D),
+                ),
+                shape = CircleShape,
+                contentPadding = PaddingValues(12.dp),
+            ) {
+                Text("Mark", color = Color.Black, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
         }
 
         if (isDetectorAvailable) {
@@ -873,6 +1032,17 @@ fun ControlBar(
             contentPadding = PaddingValues(16.dp),
         ) {
             Text("Rotate", color = Color.White, fontSize = 12.sp)
+        }
+
+        Button(
+            onClick = onOpenTrimmer,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Color(0xFF4FC3F7).copy(alpha = 0.3f),
+            ),
+            shape = CircleShape,
+            contentPadding = PaddingValues(14.dp),
+        ) {
+            Text("Trim", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
         }
 
         if (SHOW_GIMBAL_UI) {

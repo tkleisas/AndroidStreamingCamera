@@ -40,11 +40,27 @@ class RtspStreamServer(
     private var isPrepared = false
     private var currentRecordingUri: Uri? = null
     private var currentRecordingPfd: ParcelFileDescriptor? = null
+    private var recordingStartTimeMs: Long = 0L
+    private var currentRecordingName: String? = null
 
     var onClientCountChanged: ((Int) -> Unit)? = null
+    var onMarkerAdded: ((Float) -> Unit)? = null
 
     val isStreaming: Boolean
         get() = rtspCamera.isStreaming
+
+    val markers = mutableListOf<Float>()
+
+    fun addMarker(): Float {
+        if (!isRecording) return -1f
+        val elapsed = (System.currentTimeMillis() - recordingStartTimeMs) / 1000f
+        markers.add(elapsed)
+        onMarkerAdded?.invoke(elapsed)
+        Log.i(TAG, "Marker added at ${elapsed}s (total: ${markers.size})")
+        return elapsed
+    }
+
+    fun getLastRecordingUri(): Uri? = currentRecordingUri
 
     private fun prepare(): Boolean {
         if (isPrepared) return true
@@ -177,7 +193,10 @@ class RtspStreamServer(
     fun startRecording(): String? {
         return try {
             if (!prepare()) return null
+            recordingStartTimeMs = System.currentTimeMillis()
+            markers.clear()
             val name = "streamcam-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.mp4"
+            currentRecordingName = name
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val values = ContentValues().apply {
                     put(MediaStore.Video.Media.DISPLAY_NAME, name)
@@ -211,6 +230,7 @@ class RtspStreamServer(
     fun stopRecording() {
         try {
             if (rtspCamera.isRecording) rtspCamera.stopRecord()
+            writeMarkersFile()
             currentRecordingPfd?.close()
             currentRecordingPfd = null
             currentRecordingUri?.let { uri ->
@@ -298,5 +318,27 @@ class RtspStreamServer(
             Log.e(TAG, "Failed to get IP address", e)
         }
         return "0.0.0.0"
+    }
+
+    private fun writeMarkersFile() {
+        val name = currentRecordingName ?: return
+        if (markers.isEmpty()) return
+        try {
+            val json = buildString {
+                append("{\"video\":\"$name\",\"markers\":[")
+                markers.forEachIndexed { i, t ->
+                    if (i > 0) append(",")
+                    append(String.format(Locale.US, "%.2f", t))
+                }
+                append("]}")
+            }
+            val dir = File(context.filesDir, "markers")
+            if (!dir.exists()) dir.mkdirs()
+            val file = File(dir, "$name.markers.json")
+            file.writeText(json)
+            Log.i(TAG, "Markers saved: ${markers.size} markers to ${file.absolutePath}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write markers file", e)
+        }
     }
 }
