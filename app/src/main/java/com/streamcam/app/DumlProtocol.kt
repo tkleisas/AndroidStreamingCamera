@@ -19,11 +19,12 @@ object DumlProtocol {
         }
     }
 
+    // CRC-16/KERMIT (reflected poly 0x8408), matching libdjibase.so calc_crc16
     private val crc16Table = IntArray(256).also { table ->
         for (i in 0..255) {
             var crc = i
             repeat(8) {
-                crc = if (crc and 1 != 0) (crc ushr 1) xor 0xA001
+                crc = if (crc and 1 != 0) (crc ushr 1) xor 0x8408
                 else crc ushr 1
             }
             table[i] = crc
@@ -39,7 +40,7 @@ object DumlProtocol {
     }
 
     private fun crc16(data: ByteArray, offset: Int, length: Int): Int {
-        var crc = 0xDF0C
+        var crc = 0x3692
         for (i in offset until offset + length) {
             crc = (crc ushr 8) xor crc16Table[(crc xor (data[i].toInt() and 0xFF)) and 0xFF]
         }
@@ -80,19 +81,30 @@ object DumlProtocol {
 
         payload.copyInto(frame, 11)
 
-        val c = crc16(frame, 4, len - 6)
+        // CRC16 covers the whole frame except the two CRC bytes themselves
+        val c = crc16(frame, 0, len - 2)
         frame[len - 2] = (c and 0xFF).toByte()
         frame[len - 1] = ((c shr 8) and 0xFF).toByte()
 
         return frame
     }
 
-    fun speedCommand(pitchDps: Float, rollDps: Float, yawDps: Float): ByteArray {
-        val payload = ByteArray(7)
-        putS16LE(payload, 0, (pitchDps * 10).toInt())
-        putS16LE(payload, 2, (rollDps * 10).toInt())
-        putS16LE(payload, 4, (yawDps * 10).toInt())
-        payload[6] = 0x01
+    // Layout per HG305GimbalAbstraction::ActionRotateSpeed (Mimo 2.12.1)
+    // Verified on OM7 hardware: community tail order (byte6=0x80, byte7=0x00) moves the
+    // gimbal; Mimo-native order (00 80) is ACKed but ignored.
+    fun speedCommand(
+        yawDps: Float,
+        pitchDps: Float,
+        rollDps: Float = 0f,
+        byte6: Int = 0x80,
+        byte7: Int = 0x00,
+    ): ByteArray {
+        val payload = ByteArray(8)
+        putS16LE(payload, 0, (yawDps * 10).toInt().coerceIn(-3500, 3500))
+        putS16LE(payload, 2, (rollDps * 10).toInt().coerceIn(-3500, 3500))
+        putS16LE(payload, 4, (pitchDps * 10).toInt().coerceIn(-3500, 3500))
+        payload[6] = byte6.toByte()
+        payload[7] = byte7.toByte()
         return buildFrame(CMD_SET_GIMBAL, CMD_SPEED_CONTROL, payload)
     }
 

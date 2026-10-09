@@ -166,6 +166,8 @@ class GimbalController(private val context: Context) {
         stopImuStreaming()
         stopKeepalive()
         stopScan()
+        joystickJob?.cancel()
+        joystickJob = null
         gatt?.disconnect()
         gatt?.close()
         gatt = null
@@ -226,7 +228,7 @@ class GimbalController(private val context: Context) {
     }
 
     fun setSpeed(pitchDps: Float, yawDps: Float) {
-        send(DumlProtocol.speedCommand(pitchDps, 0f, yawDps))
+        send(DumlProtocol.speedCommand(yawDps, pitchDps))
     }
 
     fun recenter() {
@@ -277,6 +279,51 @@ class GimbalController(private val context: Context) {
         send(DumlProtocol.joystickPitch(0))
     }
 
+    private var joystickJob: Job? = null
+    @Volatile private var joyYawDps = 0f
+    @Volatile private var joyPitchDps = 0f
+
+    // Speed-command tail-byte variants (see OM7_BLE_PROTOCOL.md). V1 verified on OM7.
+    val speedVariant = mutableStateOf(1)
+    private val speedTails = listOf(
+        0x00 to 0x80,  // V0: Mimo-native order (ACKed but ignored on our OM7)
+        0x80 to 0x00,  // V1: community order (verified on OM2-4 / OM8P)
+        0x00 to 0xC1,  // V2: virtual-stick variant
+    )
+
+    fun cycleSpeedVariant() {
+        speedVariant.value = (speedVariant.value + 1) % speedTails.size
+        Log.i(TAG, "Speed variant -> V${speedVariant.value} tail=${speedTails[speedVariant.value]}")
+    }
+
+    fun joystickMove(yawDps: Float, pitchDps: Float) {
+        if (state.value != State.CONNECTED) return
+        joyYawDps = yawDps
+        joyPitchDps = pitchDps
+        if (joystickJob?.isActive == true) return
+        joystickJob = scope?.launch {
+            var zeroSent = 0
+            while (true) {
+                val y = joyYawDps
+                val p = joyPitchDps
+                if (y == 0f && p == 0f) {
+                    if (++zeroSent > 3) break
+                } else {
+                    zeroSent = 0
+                }
+                val tail = speedTails[speedVariant.value]
+                send(DumlProtocol.speedCommand(y, p, byte6 = tail.first, byte7 = tail.second))
+                delay(50)
+            }
+            joystickJob = null
+        }
+    }
+
+    fun joystickStop() {
+        joyYawDps = 0f
+        joyPitchDps = 0f
+    }
+
     fun stopActiveTrack() {
         if (!trackingActive) return
         Log.i(TAG, "Disabling ActiveTrack")
@@ -286,6 +333,8 @@ class GimbalController(private val context: Context) {
         send(DumlProtocol.activeTrackStop())
         send(DumlProtocol.activeTrackDisable())
     }
+
+    private val writeGate = java.util.concurrent.Semaphore(1)
 
     @SuppressLint("MissingPermission")
     private fun send(frame: ByteArray) {
@@ -297,10 +346,16 @@ class GimbalController(private val context: Context) {
             Log.w(TAG, "Send failed: writeChar is null")
             return
         }
+        // Android allows one outstanding GATT write; ungated writes get silently dropped
+        if (!writeGate.tryAcquire(120, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            Log.d(TAG, "Write gate timeout; draining stale permit")
+            writeGate.drainPermits()
+        }
         Log.d(TAG, "Send ${frame.size}B: ${frame.joinToString("") { "%02X".format(it) }}")
         if (Build.VERSION.SDK_INT >= 33) {
             val result = g.writeCharacteristic(c, frame, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
             Log.d(TAG, "Write result: $result")
+            if (result != BluetoothGatt.GATT_SUCCESS) writeGate.release()
         } else {
             @Suppress("DEPRECATION")
             c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
@@ -309,6 +364,7 @@ class GimbalController(private val context: Context) {
             @Suppress("DEPRECATION")
             val ok = g.writeCharacteristic(c)
             Log.d(TAG, "Write result: $ok")
+            if (!ok) writeGate.release()
         }
     }
 
@@ -329,6 +385,14 @@ class GimbalController(private val context: Context) {
                 state.value = State.DISCONNECTED
                 deviceName.value = null
             }
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            writeGate.release()
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {

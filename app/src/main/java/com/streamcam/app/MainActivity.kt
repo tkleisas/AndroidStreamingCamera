@@ -84,7 +84,7 @@ import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 import java.io.File
 
-private const val SHOW_GIMBAL_UI = false
+private const val SHOW_GIMBAL_UI = true
 
 class MainActivity : ComponentActivity() {
 
@@ -294,8 +294,10 @@ class MainActivity : ComponentActivity() {
                     gimbalState = gimbalState,
                     gimbalDeviceName = gimbalName,
                     onToggleGimbal = { toggleGimbal() },
-                    onTiltStart = { dir -> gimbalController?.startTilt(dir) },
-                    onTiltStop = { gimbalController?.stopTilt() },
+                    onJoystickMove = { yaw, pitch -> gimbalController?.joystickMove(yaw, pitch) },
+                    onJoystickStop = { gimbalController?.joystickStop() },
+                    speedVariant = gimbal?.speedVariant?.value ?: 0,
+                    onCycleSpeedVariant = { gimbalController?.cycleSpeedVariant() },
                     trackedIndex = currentTrackedIdx,
                     onDetectionTapped = if (detecting) { det -> onDetectionTapped(det) } else null,
                     isTracking = currentTrackedIdx >= 0,
@@ -653,8 +655,10 @@ fun StreamingScreen(
     gimbalState: GimbalController.State = GimbalController.State.DISCONNECTED,
     gimbalDeviceName: String? = null,
     onToggleGimbal: () -> Unit = {},
-    onTiltStart: (Int) -> Unit = {},
-    onTiltStop: () -> Unit = {},
+    onJoystickMove: (yawDps: Float, pitchDps: Float) -> Unit = { _, _ -> },
+    onJoystickStop: () -> Unit = {},
+    speedVariant: Int = 0,
+    onCycleSpeedVariant: () -> Unit = {},
     trackedIndex: Int = -1,
     onDetectionTapped: ((Detection) -> Unit)? = null,
                     isTracking: Boolean = false,
@@ -767,8 +771,10 @@ fun StreamingScreen(
                     isRecording = isRecording,
                     gimbalState = gimbalState,
                     onToggleGimbal = onToggleGimbal,
-                    onTiltStart = onTiltStart,
-                    onTiltStop = onTiltStop,
+                    onJoystickMove = onJoystickMove,
+                    onJoystickStop = onJoystickStop,
+                    speedVariant = speedVariant,
+                    onCycleSpeedVariant = onCycleSpeedVariant,
                     onAddMarker = onAddMarker,
                     onOpenTrimmer = onOpenTrimmer,
                 )
@@ -895,16 +901,17 @@ fun StreamInfoBar(
 }
 
 @Composable
-fun TiltHoldButton(
+fun JoystickHoldButton(
     label: String,
-    direction: Int,
-    onTiltStart: (Int) -> Unit,
-    onTiltStop: () -> Unit,
+    yawDps: Float,
+    pitchDps: Float,
+    onJoystickMove: (yawDps: Float, pitchDps: Float) -> Unit,
+    onJoystickStop: () -> Unit,
 ) {
     val source = remember { MutableInteractionSource() }
     val pressed by source.collectIsPressedAsState()
     LaunchedEffect(pressed) {
-        if (pressed) onTiltStart(direction) else onTiltStop()
+        if (pressed) onJoystickMove(yawDps, pitchDps) else onJoystickStop()
     }
     Button(
         onClick = {},
@@ -934,8 +941,10 @@ fun ControlBar(
     isRecording: Boolean = false,
     gimbalState: GimbalController.State = GimbalController.State.DISCONNECTED,
     onToggleGimbal: () -> Unit = {},
-    onTiltStart: (Int) -> Unit = {},
-    onTiltStop: () -> Unit = {},
+    onJoystickMove: (yawDps: Float, pitchDps: Float) -> Unit = { _, _ -> },
+    onJoystickStop: () -> Unit = {},
+    speedVariant: Int = 0,
+    onCycleSpeedVariant: () -> Unit = {},
     onAddMarker: () -> Unit = {},
     onOpenTrimmer: () -> Unit = {},
 ) {
@@ -1076,8 +1085,20 @@ fun ControlBar(
             }
 
             if (gimbalState == GimbalController.State.CONNECTED) {
-                TiltHoldButton("Up", 1, onTiltStart, onTiltStop)
-                TiltHoldButton("Down", -1, onTiltStart, onTiltStop)
+                Button(
+                    onClick = onCycleSpeedVariant,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.White.copy(alpha = 0.2f),
+                    ),
+                    shape = CircleShape,
+                    contentPadding = PaddingValues(14.dp),
+                ) {
+                    Text("V$speedVariant", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+                JoystickHoldButton("Left", -45f, 0f, onJoystickMove, onJoystickStop)
+                JoystickHoldButton("Right", 45f, 0f, onJoystickMove, onJoystickStop)
+                JoystickHoldButton("Up", 0f, 45f, onJoystickMove, onJoystickStop)
+                JoystickHoldButton("Down", 0f, -45f, onJoystickMove, onJoystickStop)
             }
         }
     }
