@@ -1,5 +1,10 @@
 # DJI Osmo Mobile 7 - Gimbal Control Research
 
+> **Note (2026-10):** This is the original reconnaissance doc. It is superseded by
+> `OM7_BLE_PROTOCOL.md` (the verified protocol write-up) and `docs/MIMO_NATIVE_ANALYSIS.md`
+> (static analysis of Mimo 2.12.1's native libraries). Some claims below (e.g. which libraries
+> cover which devices) may be outdated.
+
 ## Official SDK
 
 DJI's Mobile SDK (MSDK) does **not** support the Osmo Mobile consumer gimbal series. It only covers drones (Mavic, Phantom, etc.) and professional stabilizers (Ronin-MX). There is no official API or SDK for programmatic control of the Osmo Mobile 7.
