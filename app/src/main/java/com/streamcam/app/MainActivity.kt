@@ -82,13 +82,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 private const val SHOW_GIMBAL_UI = true
 
 class MainActivity : ComponentActivity() {
 
     private var streamServer: RtspStreamServer? = null
+    private var dockServer: GimbalDockServer? = null
     private var openGlView: OpenGlView? = null
     private var yoloDetector: YoloDetector? = null
     private var gimbalController: GimbalController? = null
@@ -97,6 +102,12 @@ class MainActivity : ComponentActivity() {
     private var detections = mutableStateOf<List<Detection>>(emptyList())
     private var isDetecting = mutableStateOf(false)
     private var detectionJob: Job? = null
+    private var previewJob: Job? = null
+    @Volatile private var latestJpeg: ByteArray? = null
+    @Volatile private var latestJpegMs = 0L
+    private val dockUrl = mutableStateOf<String?>(null)
+    private val dockClientCount = mutableIntStateOf(0)
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var lastRecordingUri: Uri? = null
     private var lastRecordingName: String? = null
     private var showRecordingsPicker = mutableStateOf(false)
@@ -125,6 +136,7 @@ class MainActivity : ComponentActivity() {
     ) { permissions ->
         if (permissions.values.all { it }) {
             streamServer?.startPreview()
+            startDockServer()
         } else {
             Toast.makeText(this, "Camera and microphone permissions are required", Toast.LENGTH_LONG).show()
         }
@@ -171,7 +183,9 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         onBackPressedDispatcher.addCallback(this, backPressedCallback)
 
-        if (!hasPermissions()) {
+        if (hasPermissions()) {
+            startDockServer()
+        } else {
             permissionLauncher.launch(requiredPermissions)
         }
 
@@ -187,6 +201,8 @@ class MainActivity : ComponentActivity() {
                 val gimbalState by remember { gimbal?.state ?: mutableStateOf(GimbalController.State.DISCONNECTED) }
                 val gimbalName by remember { gimbal?.deviceName ?: mutableStateOf(null) }
                 val currentTrackedIdx by remember { trackedIdx }
+                val currentDockUrl by remember { dockUrl }
+                val dockClients by remember { dockClientCount }
                 var backCameras by remember { mutableStateOf<List<CameraOption>>(emptyList()) }
                 var isRecording by remember { mutableStateOf(false) }
                 var showPicker by remember { showRecordingsPicker }
@@ -299,8 +315,13 @@ class MainActivity : ComponentActivity() {
                     speedVariant = gimbal?.speedVariant?.value ?: 0,
                     onCycleSpeedVariant = { gimbalController?.cycleSpeedVariant() },
                     trackedIndex = currentTrackedIdx,
-                    onDetectionTapped = if (detecting) { det -> onDetectionTapped(det) } else null,
+                    onDetectionTapped = if (detecting) { det ->
+                        val b = det.boundingBox
+                        handleTrackAt((b.left + b.right) / 2, (b.top + b.bottom) / 2)
+                    } else null,
                     isTracking = currentTrackedIdx >= 0,
+                    dockUrl = currentDockUrl,
+                    dockClients = dockClients,
                     onAddMarker = { streamServer?.addMarker() },
                     onOpenTrimmer = {
                         val recordings = getRecordings()
@@ -329,6 +350,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         stopDetection()
+        dockServer?.stop()
+        dockServer = null
         gimbalController?.disconnect()
         if (streamServer?.isRecording == true) streamServer?.stopRecording()
         streamServer?.stopStreaming()
@@ -363,6 +386,7 @@ class MainActivity : ComponentActivity() {
                         if (captured) {
                             val bmp = bitmap
                             val results = withContext(Dispatchers.Default) {
+                                encodePreviewFrame(bmp)
                                 detector.detect(bmp)
                             }
                             detections.value = results
@@ -484,6 +508,194 @@ class MainActivity : ComponentActivity() {
         trackedIdx.intValue = -1
         lastSeenMs = 0L
         gimbalController?.stopActiveTrack()
+    }
+
+    // Shared track-at-point entry for the Compose overlay tap and the dock's /api/track_at.
+    // Returns null on success (or toggle-off), otherwise an error message for the API caller.
+    private fun handleTrackAt(x: Float, y: Float): String? {
+        if (!isDetecting.value) {
+            if (yoloDetector == null) return "Detection unavailable"
+            startDetection()
+            return "Detection starting — try again in a moment"
+        }
+        val dets = detections.value
+        var target: Detection? = dets.firstOrNull { it.boundingBox.contains(x, y) }
+        if (target == null) {
+            var bestDist = 0.04f // 0.2 normalized distance, squared
+            for (det in dets) {
+                val cx = (det.boundingBox.left + det.boundingBox.right) / 2
+                val cy = (det.boundingBox.top + det.boundingBox.bottom) / 2
+                val d = (cx - x) * (cx - x) + (cy - y) * (cy - y)
+                if (d < bestDist) {
+                    bestDist = d
+                    target = det
+                }
+            }
+        }
+        if (target == null) return "No detection at that point"
+        onDetectionTapped(target)
+        return if (trackingClassId >= 0 &&
+            gimbalController?.state?.value != GimbalController.State.CONNECTED
+        ) {
+            "Gimbal not connected"
+        } else {
+            null
+        }
+    }
+
+    private fun startDockServer() {
+        if (dockServer != null) return
+        try {
+            val server = GimbalDockServer(dockListener)
+            server.start()
+            dockServer = server
+            dockUrl.value = server.getDockUrl()
+            Log.i("MainActivity", "Dock server at ${dockUrl.value}")
+            startPreviewLoop()
+            lifecycleScope.launch {
+                while (true) {
+                    dockClientCount.intValue = dockServer?.recentClients() ?: 0
+                    delay(2000)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Failed to start dock server", e)
+        }
+    }
+
+    private val dockListener = object : GimbalDockServer.Listener {
+        override fun onDockMove(yawDps: Float, pitchDps: Float) {
+            mainHandler.post { gimbalController?.joystickMove(yawDps, pitchDps) }
+        }
+
+        override fun onDockStop() {
+            mainHandler.post { gimbalController?.joystickStop() }
+        }
+
+        override fun onDockCenter() {
+            mainHandler.post {
+                stopTracking()
+                gimbalController?.recenter()
+            }
+        }
+
+        override fun onDockTrackAt(x: Float, y: Float): String? {
+            var result: String? = null
+            val latch = CountDownLatch(1)
+            mainHandler.post {
+                try {
+                    result = handleTrackAt(x, y)
+                } finally {
+                    latch.countDown()
+                }
+            }
+            return if (latch.await(3, TimeUnit.SECONDS)) result else "App busy — try again"
+        }
+
+        override fun onDockTrackStop() {
+            mainHandler.post { stopTracking() }
+        }
+
+        override fun getDockStatusJson(clients: Int): String {
+            val gimbal = gimbalController
+            return buildString {
+                append("{\"gimbal\":\"")
+                append(gimbal?.state?.value?.name ?: "DISCONNECTED")
+                append("\",\"deviceName\":")
+                append(gimbal?.deviceName?.value?.let { "\"${GimbalDockServer.jsonEscape(it)}\"" } ?: "null")
+                append(",\"tracking\":").append(gimbal?.isTracking == true)
+                append(",\"detecting\":").append(isDetecting.value)
+                append(",\"streaming\":").append(isCurrentlyStreaming)
+                append(",\"clients\":").append(clients)
+                append("}")
+            }
+        }
+
+        override fun getDockDetectionsJson(): String {
+            val dets = detections.value
+            val tracked = trackedIdx.intValue
+            return buildString {
+                append("{\"tracked\":").append(tracked).append(",\"boxes\":[")
+                dets.forEachIndexed { i, d ->
+                    if (i > 0) append(",")
+                    val b = d.boundingBox
+                    append(
+                        String.format(
+                            Locale.US,
+                            "{\"x\":%.4f,\"y\":%.4f,\"w\":%.4f,\"h\":%.4f,\"label\":\"%s\",\"conf\":%.2f}",
+                            b.left, b.top, b.width(), b.height(),
+                            GimbalDockServer.jsonEscape(d.label), d.confidence,
+                        )
+                    )
+                }
+                append("]}")
+            }
+        }
+
+        override fun getDockPreviewJpeg(): ByteArray? {
+            val jpeg = latestJpeg ?: return null
+            return if (System.currentTimeMillis() - latestJpegMs < 3000) jpeg else null
+        }
+    }
+
+    // Downscale to ~960px wide and encode as JPEG for the dock's preview feed.
+    private fun encodePreviewFrame(src: Bitmap) {
+        try {
+            val scale = if (src.width > 960) 960f / src.width else 1f
+            val scaled = if (scale < 1f) {
+                Bitmap.createScaledBitmap(
+                    src,
+                    (src.width * scale).toInt(),
+                    (src.height * scale).toInt(),
+                    true,
+                )
+            } else {
+                src
+            }
+            val baos = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 70, baos)
+            if (scaled !== src) scaled.recycle()
+            latestJpeg = baos.toByteArray()
+            latestJpegMs = System.currentTimeMillis()
+        } catch (e: Exception) {
+            Log.w("MainActivity", "Preview encode failed", e)
+        }
+    }
+
+    // Captures preview frames only while the dock has had a recent /preview.jpg request
+    // (the detection loop encodes frames itself when it's running).
+    private fun startPreviewLoop() {
+        if (previewJob != null) return
+        previewJob = lifecycleScope.launch {
+            var bitmap: Bitmap? = null
+            var failures = 0
+            try {
+                while (isActive) {
+                    val dock = dockServer
+                    val view = openGlView
+                    if (isDetecting.value || dock == null || !dock.isPreviewWanted() ||
+                        view == null || view.width <= 0 || view.height <= 0
+                    ) {
+                        delay(400)
+                        continue
+                    }
+                    if (bitmap == null || bitmap.width != view.width || bitmap.height != view.height) {
+                        bitmap?.recycle()
+                        bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
+                    }
+                    val bmp = bitmap
+                    if (captureFrame(view, bmp)) {
+                        failures = 0
+                        withContext(Dispatchers.Default) { encodePreviewFrame(bmp) }
+                    } else if (++failures >= 5) {
+                        latestJpeg = null // force /preview.jpg to answer 503
+                    }
+                    delay(250)
+                }
+            } finally {
+                bitmap?.recycle()
+            }
+        }
     }
 
     private suspend fun captureFrame(view: OpenGlView, dest: Bitmap): Boolean {
@@ -662,6 +874,8 @@ fun StreamingScreen(
     trackedIndex: Int = -1,
     onDetectionTapped: ((Detection) -> Unit)? = null,
                     isTracking: Boolean = false,
+    dockUrl: String? = null,
+    dockClients: Int = 0,
     onAddMarker: () -> Unit = {},
     onOpenTrimmer: () -> Unit = {},
 ) {
@@ -723,6 +937,8 @@ fun StreamingScreen(
                     gimbalConnected = gimbalState == GimbalController.State.CONNECTED,
                     gimbalName = gimbalDeviceName,
                     isTracking = isTracking,
+                    dockUrl = dockUrl,
+                    dockClients = dockClients,
                 )
             } else {
                 Spacer(Modifier.height(1.dp))
@@ -828,6 +1044,8 @@ fun StreamInfoBar(
     gimbalConnected: Boolean = false,
     gimbalName: String? = null,
     isTracking: Boolean = false,
+    dockUrl: String? = null,
+    dockClients: Int = 0,
 ) {
     Column(
         modifier = Modifier
@@ -897,6 +1115,31 @@ fun StreamInfoBar(
                 Toast.makeText(context, "URL copied!", Toast.LENGTH_SHORT).show()
             },
         )
+
+        if (dockUrl != null) {
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Dock URL (tap to copy):", color = Color.White.copy(alpha = 0.6f), fontSize = 11.sp)
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = "Dock: $dockClients" + if (dockClients != 1) " clients" else " client",
+                    color = Color.White.copy(alpha = 0.8f),
+                    fontSize = 11.sp,
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = dockUrl,
+                color = Color(0xFF4FC3F7),
+                fontSize = 14.sp,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier.clickable {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("Dock URL", dockUrl))
+                    Toast.makeText(context, "URL copied!", Toast.LENGTH_SHORT).show()
+                },
+            )
+        }
     }
 }
 

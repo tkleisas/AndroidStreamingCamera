@@ -159,6 +159,7 @@ class GimbalController(private val context: Context) {
         state.value = State.CONNECTING
         deviceName.value = device.name
         gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        startTx()
     }
 
     @SuppressLint("MissingPermission")
@@ -168,6 +169,7 @@ class GimbalController(private val context: Context) {
         stopScan()
         joystickJob?.cancel()
         joystickJob = null
+        stopTx()
         gatt?.disconnect()
         gatt?.close()
         gatt = null
@@ -335,37 +337,97 @@ class GimbalController(private val context: Context) {
     }
 
     private val writeGate = java.util.concurrent.Semaphore(1)
+    private val txQueue = java.util.concurrent.LinkedBlockingQueue<ByteArray>(512)
+    private val txDropped = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var txThread: Thread? = null
 
-    @SuppressLint("MissingPermission")
     private fun send(frame: ByteArray) {
-        val g = gatt ?: run {
+        if (gatt == null) {
             Log.w(TAG, "Send failed: gatt is null")
             return
         }
-        val c = writeChar ?: run {
+        if (writeChar == null) {
             Log.w(TAG, "Send failed: writeChar is null")
             return
         }
-        // Android allows one outstanding GATT write; ungated writes get silently dropped
-        if (!writeGate.tryAcquire(120, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-            Log.d(TAG, "Write gate timeout; draining stale permit")
-            writeGate.drainPermits()
+        if (!txQueue.offer(frame)) {
+            // Sustained overload: drop the oldest queued frame (a stream frame) and count it
+            txQueue.poll()
+            txQueue.offer(frame)
+            val dropped = txDropped.incrementAndGet()
+            if (dropped % 100 == 1) {
+                Log.w(TAG, "TX queue full; dropped oldest frame ($dropped total)")
+            }
         }
+    }
+
+    private fun startTx() {
+        stopTx()
+        writeGate.drainPermits()
+        writeGate.release()
+        val t = Thread(::txLoop, "GimbalTx")
+        t.isDaemon = true
+        txThread = t
+        t.start()
+    }
+
+    private fun stopTx() {
+        txThread?.interrupt()
+        txThread = null
+        txQueue.clear()
+    }
+
+    private fun txLoop() {
+        while (!Thread.currentThread().isInterrupted) {
+            val frame = try {
+                txQueue.take()
+            } catch (_: InterruptedException) {
+                break
+            }
+            try {
+                transmit(frame)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun transmit(frame: ByteArray) {
+        val g = gatt ?: return
+        val c = writeChar ?: return
         Log.d(TAG, "Send ${frame.size}B: ${frame.joinToString("") { "%02X".format(it) }}")
-        if (Build.VERSION.SDK_INT >= 33) {
-            val result = g.writeCharacteristic(c, frame, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
-            Log.d(TAG, "Write result: $result")
-            if (result != BluetoothGatt.GATT_SUCCESS) writeGate.release()
-        } else {
-            @Suppress("DEPRECATION")
-            c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            @Suppress("DEPRECATION")
-            c.value = frame
-            @Suppress("DEPRECATION")
-            val ok = g.writeCharacteristic(c)
-            Log.d(TAG, "Write result: $ok")
-            if (!ok) writeGate.release()
+        var retries = 0
+        while (retries < 50) {
+            // Android allows one outstanding GATT write; gate serializes us with the callback
+            if (!writeGate.tryAcquire(500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                Log.w(TAG, "Write gate timeout; proceeding anyway")
+            }
+            val accepted: Boolean
+            val statusText: String
+            if (Build.VERSION.SDK_INT >= 33) {
+                val result = g.writeCharacteristic(c, frame, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                accepted = result == BluetoothGatt.GATT_SUCCESS
+                statusText = result.toString()
+            } else {
+                @Suppress("DEPRECATION")
+                c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                @Suppress("DEPRECATION")
+                c.value = frame
+                @Suppress("DEPRECATION")
+                accepted = g.writeCharacteristic(c)
+                statusText = accepted.toString()
+            }
+            if (accepted) {
+                Log.d(TAG, "Write result: $statusText" + if (retries > 0) " (after $retries retries)" else "")
+                return  // gate released by onCharacteristicWrite
+            }
+            // e.g. 201 ERROR_GATT_WRITE_REQUEST_BUSY: rejected, no callback coming; retry same frame
+            writeGate.release()
+            retries++
+            Thread.sleep(10)
         }
+        Log.w(TAG, "Write failed after $retries attempts; dropping frame (${frame.size}B)")
     }
 
     @SuppressLint("MissingPermission")
@@ -379,6 +441,7 @@ class GimbalController(private val context: Context) {
                 Log.i(TAG, "GATT disconnected (status=$status)")
                 stopImuStreaming()
                 stopKeepalive()
+                stopTx()
                 gatt.close()
                 this@GimbalController.gatt = null
                 writeChar = null

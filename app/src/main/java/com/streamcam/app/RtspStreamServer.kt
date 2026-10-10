@@ -33,6 +33,26 @@ class RtspStreamServer(
     companion object {
         private const val TAG = "RtspStreamServer"
         const val DEFAULT_PORT = 8554
+
+        fun getDeviceIpAddress(): String {
+            try {
+                val interfaces = NetworkInterface.getNetworkInterfaces()
+                while (interfaces.hasMoreElements()) {
+                    val networkInterface = interfaces.nextElement()
+                    if (networkInterface.isLoopback || !networkInterface.isUp) continue
+                    val addresses = networkInterface.inetAddresses
+                    while (addresses.hasMoreElements()) {
+                        val address = addresses.nextElement()
+                        if (address is Inet4Address && !address.isLoopbackAddress) {
+                            return address.hostAddress ?: "0.0.0.0"
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get IP address", e)
+            }
+            return "0.0.0.0"
+        }
     }
 
     private val rtspCamera = RtspServerCamera2(openGlView, this, port)
@@ -298,26 +318,6 @@ class RtspStreamServer(
 
     override fun onAuthSuccess() {
         Log.i(TAG, "Client auth success")
-    }
-
-    private fun getDeviceIpAddress(): String {
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val networkInterface = interfaces.nextElement()
-                if (networkInterface.isLoopback || !networkInterface.isUp) continue
-                val addresses = networkInterface.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val address = addresses.nextElement()
-                    if (address is Inet4Address && !address.isLoopbackAddress) {
-                        return address.hostAddress ?: "0.0.0.0"
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to get IP address", e)
-        }
-        return "0.0.0.0"
     }
 
     private fun writeMarkersFile() {

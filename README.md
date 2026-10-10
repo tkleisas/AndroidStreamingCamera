@@ -93,6 +93,26 @@ Then connect to `rtsp://localhost:8554/` instead.
 - Gimbal (DJI Osmo) follows the tracked object via BLE
 - Requires Bluetooth permissions
 
+### OBS dock panel
+
+The phone hosts a small HTTP server (port **8556**) with a web page for gimbal control,
+designed to be docked inside OBS Studio:
+
+1. In OBS: **View → Docks → Custom Browser Docks…**
+2. Name it `Gimbal`, URL `http://PHONE_IP:8556/` (the URL is shown in the app's status bar while streaming)
+
+The dock page offers:
+
+- **Live preview** (~4 fps JPEG) with detection boxes overlaid — click a box to start ActiveTrack, click again to stop
+- **D-pad** pan/tilt (press-and-hold) plus arrow/WASD keys
+- **Speed slider** (10–120 °/s), **Center** and **Stop Track** buttons
+
+Notes:
+
+- Full-motion video still comes from the RTSP Media Source (`rtsp://PHONE_IP:8554/`); the dock is control + a low-fps preview only
+- The preview requires the StreamCam app to be in the foreground (frames are captured from the camera preview view); otherwise the dock shows "preview unavailable"
+- The dock server is **LAN-only and unauthenticated** — same trust model as the RTSP server. Don't expose it beyond your local network
+
 ## Tech Stack
 
 - Kotlin + Jetpack Compose

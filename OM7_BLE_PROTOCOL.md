@@ -203,7 +203,9 @@ payload: yaw(s16 LE)  roll(s16 LE)  pitch(s16 LE)  byte6 = 0x00  byte7 = 0x80
 | `0x04`  | `0x52` | `camera_atti` — phone IMU stream (see above) |
 | `0x04`  | `0x54` | `gimbal_feature_control` |
 | `0x04`  | `0x58` | `set_stick_control_enable` — handheld stick enable |
-| `0x04`  | `0x57` | Position telemetry **push** (8-byte; bytes 0–1 = pitch×10 s16 LE, 2–3 = yaw×10). Push-only id, no request instantiation |
+| `0x04`  | `0x57` | Stick + button state **push** at ~20 Hz (8-byte; constant `0000000001000000` when idle). NOT position telemetry as previously thought — that decode came from a dead-end script. |
+| `0x04`  | `0x05` | **Attitude push** at 1 Hz (36 bytes, all unique): `payload[0:2]`=pitch, `[2:4]`=roll, `[4:6]`=yaw (s16 LE, 0.1°), `[12:16]`=device ms clock (u32). Verified by correlation with joystick moves. Cannot be sped up (OM8P measurement). |
+| `0x04`  | `0x71` | 1 Hz push, 30 bytes, float-bearing — likely quaternion/extended attitude; pushed alongside `0x05`. |
 | `0x04`  | `0x65` | `action_handle_log` — our init-seq `010100` "mode set" is actually the **gimbal log enable** |
 | `0x04`  | `0x68` | `cali_data_exist` / `hw_test_param` — our "periodic config" |
 | `0x04`  | `0x6F` / `0x77` | Telemetry pushes |
@@ -217,22 +219,30 @@ payload: yaw(s16 LE)  roll(s16 LE)  pitch(s16 LE)  byte6 = 0x00  byte7 = 0x80
 The full extracted table has **319 command instantiations** — see
 `docs/dji_cmd_base_req_table.txt` and `docs/MIMO_NATIVE_ANALYSIS.md`.
 
-### Recenter command (CONFIRMED working)
+### Recenter command (CONFIRMED working 2026-10-10)
 
-`cmd_set=0x04 cmd_id=0x14` is the **absolute-angle move** command and it DOES work on OM7. Mimo uses it for recenter:
+**Mimo's recenter on the OM7 is `cmd_set=0x04 cmd_id=0x4C` (`set_work_mode_and_return_center`)
+with payload `FE 08`** — NOT the legacy `0x14` absolute-angle command:
 
 ```
-recv=0x04  set=0x04  id=0x14  payload = 8 bytes:
-  bytes 0-1: pitch (s16 LE, ×10 deg)
-  bytes 2-3: roll  (s16 LE, ×10 deg)
-  bytes 4-5: yaw   (s16 LE, ×10 deg)
-  byte 6:    control (0x0F = absolute + all axes enabled)
-  byte 7:    duration in tenths of a second (0x0A = 1.0s)
+recv=0x04  set=0x04  id=0x4C  payload = 2 bytes:
+  byte 0: work_mode          ; 0xFE = keep current mode (01/02 = ActiveTrack enable/disable)
+  byte 1: return_center_cmd  ; 0x08 = return to center, 0x00 = none
 ```
 
-Mimo's recenter is `pl=0000000000000F0A` (all angles zero, all axes, 1s).
+Verified on hardware: gimbal ACKs with `ret=00` and swings back to center. The semantics were
+recovered from Mimo 2.12.1 native code: `GimbalAbstraction::ActionResetGimbal` (bound to the SDK
+key "ResetGimbal") builds exactly `FE <return_center_cmd>`; HG305 inherits this path
+(see docs/MIMO_NATIVE_ANALYSIS.md, "Follow-up: recenter path on HG305").
 
-**Why earlier attempts failed**: we tried this command before implementing notification ACKs. The OM7 had already entered its watchdog-triggered "comms is dead" state and was ignoring all motor commands. After fixing the ACK loop (responding to the gimbal's flags=`0x40` notifications with flags=`0x80` echoes), this command works.
+**The legacy `0x14` (`set_control_gimbal_angle_ex`) is dead on the OM7**: frames are silently
+dropped — no ACK, no motion. The binary shows why: `0x14` is only emitted by key actions
+(`RotateByAngleAction` etc.) that HG212/HG214/HG225/... register, but **HG305 never registers
+them**. (On the OM8P it's ACKed but ignored — same command-family deprecation.) Our earlier
+"recenter works via 0x14" note was a misattribution — it was never observed working from the app.
+
+`DumlProtocol.absoluteAngleCommand()` is kept for reference but unused; `recenterCommand()`
+builds the `0x4C FE 08` frame.
 
 ## Authentication / handshake
 
@@ -266,15 +276,20 @@ The gimbal accepts ActiveTrack commands without all of this — heartbeat + the 
 - **`GimbalController.kt`** — BLE scan/connect/MTU/services discovery on FFF0, with a heartbeat coroutine and a 10Hz ActiveTrack streaming coroutine. `startActiveTrack(x, y, w, h)` enables tracking and starts the stream; `updateTrackTarget` updates the box atomically; `stopActiveTrack` tears it all down.
 - **`MainActivity.kt`** — when the user taps a YOLO detection, we call `startActiveTrack` with that detection's normalized box. Subsequent detections of the same class+area update the box via `updateTrackTarget`. Tap the same detection again to stop. The on-device PID was removed — the gimbal's own controller is the loop.
 
-### Android BLE write gating (community finding, OM8P — applies to us)
+### Android BLE write gating + TX queue (community finding, OM8P — confirmed the hard way on OM7)
 
-**Android permits one outstanding GATT write per connection.** A high-rate command loop that
-doesn't wait for `onCharacteristicWrite` silently drops almost every frame (179 landed out of
-thousands in their testing) with no error anywhere. `GimbalController.send()` currently fires
-freely — fine at our current rates, but mandatory before any 10–20 Hz velocity-command
-streaming: gate writes on `onCharacteristicWrite` with a ~120 ms timeout fallback (some devices
-never deliver the callback). Also: quick reconnects yield GATT error 133 for ~10 s while the
-gimbal releases the old link — retry, don't treat as fatal.
+**Android permits one outstanding GATT write per connection.** On API 33+, an over-eager write
+fails with `writeCharacteristic` returning **201 = `ERROR_GATT_WRITE_REQUEST_BUSY`** and the
+frame is silently dropped. Our logs showed ~13% of all writes dropped (9,858 / 76,598) —
+stream frames (20 Hz joystick) tolerate this, but one-shot commands like recenter were eaten,
+which is why "Center" appeared dead even before the protocol fix.
+
+**Implemented fix** (GimbalController): `send()` is a non-blocking enqueue into a
+`LinkedBlockingQueue` (512; drops oldest on overflow — stream frames first); a single daemon TX
+thread serializes writes, gating each on `onCharacteristicWrite` (500 ms timeout fallback) and
+**retrying the same frame** (10 ms backoff, up to 50 attempts) on any non-success result. Zero
+drops observed after the fix (8,001/8,001 transmitted). Also: quick reconnects yield GATT error
+133 for ~10 s while the gimbal releases the old link — retry, don't treat as fatal.
 
 ## External references
 
@@ -303,7 +318,9 @@ Other public DJI BLE reverse-engineering work that informs (but does not solve) 
 **The OM7 disables its motors when communications appear broken.** Recovery requires pressing the physical M button on the gimbal. There are two distinct failure modes that look identical from the outside:
 
 1. **Invalid commands** — sending a malformed or unrecognised command can immediately lock the motors.
-2. **Missing notification ACKs** — the gimbal sends ~10 push notifications/sec (e.g. `set=0x04 id=0x57`, `set=0x05 id=0x06`) with `flags=0x40` (request, ack-required). If the host doesn't echo ACKs back, the gimbal's watchdog concludes the host is dead and locks motors after 60-120 seconds. The legacy `cmd=0x04/0x14` recenter command is *one of the things that gets ignored once the watchdog has triggered* — which is why early attempts at recenter looked like the command itself was unsupported.
+2. **Missing notification ACKs** — the gimbal sends ~10 push notifications/sec (e.g. `set=0x04 id=0x57`, `set=0x05 id=0x06`) with `flags=0x40` (request, ack-required). If the host doesn't echo ACKs back, the gimbal's watchdog concludes the host is dead and locks motors after 60-120 seconds.
+
+**Response/error codes**: command ACKs carry a device ret code in the first payload byte — `00` = success; `0xFF` = generic refusal (maps to SDK error −511 via the native table at libdjisdk_jni 0xbe4170). We occasionally see `0xFF` (ACK payload `ff 08`) on a few speed frames during mode transitions — transient, not a lockout signature.
 
 **Mitigation**: parse every incoming notification, and for any with `flags & 0xE0 == 0x40` send back a response frame with `flags=0x80`, the same `(seq, cmd_set, cmd_id)`, `sender=0x02`, and `receiver=<their_sender>`, with an empty payload. With this in place, motors stay alive for 4+ minutes and the recenter command works.
  This makes byte-for-byte protocol verification critical — speculative commands cost the user a manual reset every time. Rules of thumb:

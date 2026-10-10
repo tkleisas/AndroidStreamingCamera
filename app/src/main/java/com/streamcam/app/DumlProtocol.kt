@@ -123,7 +123,11 @@ object DumlProtocol {
         return buildFrame(CMD_SET_GIMBAL, CMD_ABSOLUTE_ANGLE, payload)
     }
 
-    fun recenterCommand(): ByteArray = absoluteAngleCommand(0f, 0f, 0f, 10)
+    // OM7 (HG305) recenter: set_work_mode_and_return_center with work_mode=0xFE (keep current)
+    // + return_center_cmd=0x08. The legacy 0x14 absolute-angle command is not registered by
+    // HG305 firmware and is silently dropped (verified on hardware 2026-10-10).
+    fun recenterCommand(): ByteArray =
+        buildFrame(0x04, 0x4C, byteArrayOf(0xFE.toByte(), 0x08))
 
     fun heartbeatGimbal(): ByteArray =
         buildFrame(0x00, 0x00, byteArrayOf(0x02, 0x00), receiver = 0x27)

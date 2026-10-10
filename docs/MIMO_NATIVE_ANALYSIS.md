@@ -311,3 +311,88 @@ Also seen in `Encode`: an optional obfuscation path (XOR keystream table at 0x28
   (with CRC16 fixed to KERMIT first).
 - Push telemetry cmd ids (0x57/0x6F/0x77) are registered via `ObserverPushPack<T>` with the id
   inside pack-type statics; not extracted (capture-derived values stand).
+
+---
+
+## Follow-up: recenter path on HG305
+
+Hardware evidence: `0x04/0x14` (`set_control_gimbal_angle_ex`, `…0F0A`) is **ignored** by the
+OM7 (not even ACKed). Analysis of the native recenter path says that is expected — recenter on
+OM7 does **not** use 0x14.
+
+### The recenter command is 0x04/0x4C with the return-center flag
+
+`dji_gimbal_set_work_mode_and_return_center_req` (0x04/0x4C) is exactly the command behind the
+SDK's **"ResetGimbal"** action:
+
+- `GimbalAbstraction::CreateCharacteristics` (0x20eaee4) binds key **"ResetGimbal"** (string at
+  0xbccd80) to `std::bind(&GimbalAbstraction::ActionResetGimbal, …)` (vtable ref resolved from
+  GOT 0x2761a68).
+- HG305 reaches it by inheritance: `HG305GimbalAbstraction::CreateCharacteristics` (0x21334a0)
+  → calls `HG303…` (0x212e78c) → `HG302…` (0x20c9dd4) → `HandheldGimbalAbstraction…`
+  (0x20db574) → `GimbalAbstraction::CreateCharacteristics`. Chain verified from the first `bl`
+  of each function.
+- The OM7 instance is `MixAbs<HG305GimbalAbstraction, key::HG305GimbalAbs>` (symbol at
+  0x15a9f90); `key::HG305GimbalAbs::WillSetup` (0x213f084) adds only `GimbalVerticalShotEnabled`
+  — it does **not** bind the key-layer `ResetGimbalAction`, but the sdk-layer base binding above
+  applies.
+
+**Payload semantics (2 bytes), proven by `ResetGimbalAction` (0x21a2ff0) log line at 0x21a3208:**
+
+```
+"[ResetGimbal] return_center_cmd = " << payload[1] << ", work_mode = " << payload[0]
+```
+
+- byte0 = **work_mode** (0xFE = "keep current mode" sentinel; 0x01/0x02 = the values we use for
+  ActiveTrack enable/disable)
+- byte1 = **return_center_cmd** (0x00 = none; **0x08 = return to center**)
+
+All four construction sites of the 0x4C req (ctor PLT 0x26368c0 xrefs):
+
+| function | addr | payload built |
+|---|---|---|
+| `GimbalAbstraction::ActionResetGimbal` | 0x210510c | `FE <value&0xFF>` — byte0 hardcoded 0xFE, byte1 from the action value |
+| `GimbalAbstraction::SetGimbalMode` | 0x2106714 | `<mode> 00` — matches our captured `01 00`/`02 00` |
+| `ResetGimbalAction` (key layer; **not** bound on HG305) | 0x21a2ff0 | value==0xFFFE → fetches current "GimbalMode" key → `<mode> 08`; else `FE <value>` |
+| `GimbalModeSet` (key layer) | 0x21aaba4 | `<mode> 08` — mode change **with** return-center |
+
+So the on-wire recenter is almost certainly **`recv=0x04 set=0x04 id=0x4C pl=FE 08`**
+("keep work mode, return center"), sent by the packed Kotlin layer calling the `ResetGimbal`
+action with value 8. (`FE 00` if it passes 0; byte1 is the knob. Worth snooping one recenter to
+confirm byte1.)
+
+### Why 0x14 exists but is dead on OM7
+
+0x04/0x14 is built by `GetRotateAnglePack` (0x21a523c, payload = pitch/roll/yaw ×10 s16 + ctrl +
+duration — our documented layout is right) and only surfaced through key-layer actions
+`RotateByAngleAction`/`RotateByAngleNewAction` (0x0A), which are registered **only** by
+HG212/HG214/HG215/HG224/HG225/HG325/ET510/QM001 key abs classes — **HG305 does not register
+them** (GOT-xref scan over the whole .text). Same for `MotionControlAction` (0x04/0x01, 10-byte
+payload). So on OM7, Mimo never intentionally sends 0x14; the `…0F0A` frame in our old capture
+was likely emitted by a generic/init path and ignored by the gimbal, and the "recenter worked
+after ACK fix" observation was probably the gimbal recentering due to the `0x4C` mode traffic,
+not 0x14.
+
+Related: `KeyRecenterProgressPush` (0x21afab0, from `dji_gimbal_state_push`) and
+`KeyRecenterProgressFrom0405Push` (0x215dff4) — the gimbal pushes recenter progress; consistent
+with both trigger-double-press (handled by gimbal firmware, no BLE) and app-initiated recenter.
+
+### 0x04/0x0C ACK payloads `00 00` vs `ff 08`
+
+- Response bodies reach the SDK as `dji_cmd_rsp` { len@+0x24, ptr@+0x28 } (from the
+  `SendSetPack`/`SendActionPack` result lambdas, e.g. 0x21ab8d8).
+- The device **ret code is a single byte** (body byte 0):
+  `BaseAbstraction::ConvertRetCodeToErrorCode(Characteristics, AccessType, u8)` (0x15cfc34) and
+  `CheckErrorCode(u8)` (0x15d2e08; 0→0, 0xE0→−1, 0xE3→−6, 0xEC→−7, else −0xFFFF).
+- `ConvertRetCodeToErrorCode` maps ret codes 0xC0–0xFF through a 64-entry u32 table at
+  **0xbe4170**: 0xC0→−448, 0xD0–0xD9→−464…−473, 0xE0→−480, …, **0xFF→−511**. (Symbolic names
+  for these are in the packed Kotlin `DJIError` enum, not in native strings.)
+- Therefore `00 00` = ret 0x00 (success) + one body byte 0x00, and `ff 08` = **ret 0xFF**
+  (generic refusal → SDK error −511) **+ body byte 0x08** (likely a sub-reason/state; not
+  decoded by the gimbal abstraction — `GimbalAbstraction::ConvertRetCodeToErrorCode` at
+  0x20eacf4 collapses any nonzero ret to −7).
+- If the ACK ret is actually u16 LE, `ff 08` would be 0x08FF — but all native extraction points
+  treat the ret as one byte (`and w8, w19, #0xff` etc.), so the u8 reading is favored.
+- Practical reading: 0xFF = "rejected in current state" (transient — 7/184 in the user's data),
+  e.g. speed frames sent while the gimbal is busy (recentering/calibrating) or in a mode that
+  doesn't accept velocity control. Not a watchdog/lockout signature.
