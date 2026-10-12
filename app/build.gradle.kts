@@ -63,6 +63,8 @@ dependencies {
 
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 
+    implementation("org.luaj:luaj-jse:3.0.1")
+
     implementation("androidx.media3:media3-exoplayer:1.5.1")
     implementation("androidx.media3:media3-ui:1.5.1")
 }

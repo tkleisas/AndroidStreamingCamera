@@ -84,6 +84,7 @@ import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.security.SecureRandom
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -106,7 +107,10 @@ class MainActivity : ComponentActivity() {
     @Volatile private var latestJpeg: ByteArray? = null
     @Volatile private var latestJpegMs = 0L
     private val dockUrl = mutableStateOf<String?>(null)
+    private val dockToken = mutableStateOf<String?>(null)
     private val dockClientCount = mutableIntStateOf(0)
+    private val scriptRunningName = mutableStateOf<String?>(null)
+    private var scriptEngine: ScriptEngine? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastRecordingUri: Uri? = null
     private var lastRecordingName: String? = null
@@ -183,14 +187,15 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         onBackPressedDispatcher.addCallback(this, backPressedCallback)
 
+        yoloDetector = YoloDetector.create(this)
+        gimbalController = GimbalController(this)
+        scriptEngine = ScriptEngine(this, scriptHost)
+
         if (hasPermissions()) {
             startDockServer()
         } else {
             permissionLauncher.launch(requiredPermissions)
         }
-
-        yoloDetector = YoloDetector.create(this)
-        gimbalController = GimbalController(this)
 
         setContent {
             StreamCamTheme {
@@ -202,7 +207,9 @@ class MainActivity : ComponentActivity() {
                 val gimbalName by remember { gimbal?.deviceName ?: mutableStateOf(null) }
                 val currentTrackedIdx by remember { trackedIdx }
                 val currentDockUrl by remember { dockUrl }
+                val currentDockToken by remember { dockToken }
                 val dockClients by remember { dockClientCount }
+                val runningScript by remember { scriptRunningName }
                 var backCameras by remember { mutableStateOf<List<CameraOption>>(emptyList()) }
                 var isRecording by remember { mutableStateOf(false) }
                 var showPicker by remember { showRecordingsPicker }
@@ -322,6 +329,8 @@ class MainActivity : ComponentActivity() {
                     isTracking = currentTrackedIdx >= 0,
                     dockUrl = currentDockUrl,
                     dockClients = dockClients,
+                    dockToken = currentDockToken,
+                    scriptName = runningScript,
                     onAddMarker = { streamServer?.addMarker() },
                     onOpenTrimmer = {
                         val recordings = getRecordings()
@@ -350,6 +359,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         stopDetection()
+        scriptEngine?.stop()
         dockServer?.stop()
         dockServer = null
         gimbalController?.disconnect()
@@ -543,13 +553,42 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun getOrCreateDockToken(): String {
+        val prefs = getSharedPreferences("streamcam", Context.MODE_PRIVATE)
+        val existing = prefs.getString("dock_token", null)
+        if (existing != null) return existing
+        val bytes = ByteArray(12)
+        SecureRandom().nextBytes(bytes)
+        val token = bytes.joinToString("") { "%02x".format(it) }
+        prefs.edit().putString("dock_token", token).apply()
+        return token
+    }
+
+    /** Runs [block] on the main thread and waits (bounded) for its result. */
+    private fun <T> callOnMain(block: () -> T): T {
+        var result: Result<T>? = null
+        val latch = CountDownLatch(1)
+        mainHandler.post {
+            result = try {
+                Result.success(block())
+            } catch (t: Throwable) {
+                Result.failure(t)
+            }
+            latch.countDown()
+        }
+        latch.await(5, TimeUnit.SECONDS)
+        return result?.getOrThrow() ?: throw RuntimeException("App busy — try again")
+    }
+
     private fun startDockServer() {
         if (dockServer != null) return
         try {
-            val server = GimbalDockServer(dockListener)
+            val token = getOrCreateDockToken()
+            val server = GimbalDockServer(dockListener, token)
             server.start()
             dockServer = server
             dockUrl.value = server.getDockUrl()
+            dockToken.value = token
             Log.i("MainActivity", "Dock server at ${dockUrl.value}")
             startPreviewLoop()
             lifecycleScope.launch {
@@ -579,18 +618,8 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        override fun onDockTrackAt(x: Float, y: Float): String? {
-            var result: String? = null
-            val latch = CountDownLatch(1)
-            mainHandler.post {
-                try {
-                    result = handleTrackAt(x, y)
-                } finally {
-                    latch.countDown()
-                }
-            }
-            return if (latch.await(3, TimeUnit.SECONDS)) result else "App busy — try again"
-        }
+        override fun onDockTrackAt(x: Float, y: Float): String? =
+            callOnMain { handleTrackAt(x, y) }
 
         override fun onDockTrackStop() {
             mainHandler.post { stopTracking() }
@@ -635,6 +664,117 @@ class MainActivity : ComponentActivity() {
         override fun getDockPreviewJpeg(): ByteArray? {
             val jpeg = latestJpeg ?: return null
             return if (System.currentTimeMillis() - latestJpegMs < 3000) jpeg else null
+        }
+
+        override fun onScriptRun(code: String?, name: String?): String? {
+            val engine = scriptEngine ?: return "Script engine not ready"
+            return if (code != null) {
+                engine.run(code, name ?: "inline")
+            } else {
+                engine.runSaved(name!!)
+            }
+        }
+
+        override fun onScriptStop() {
+            scriptEngine?.stop()
+        }
+
+        override fun getScriptStatusJson(): String =
+            scriptEngine?.statusJson() ?: "{\"running\":false,\"name\":\"\",\"output\":\"\"}"
+
+        override fun getScriptsJson(): String {
+            val names = scriptEngine?.listScripts() ?: emptyList()
+            return names.joinToString(",", "[", "]") { "\"${GimbalDockServer.jsonEscape(it)}\"" }
+        }
+
+        override fun getScriptCode(name: String): String? = scriptEngine?.readScript(name)
+
+        override fun saveScript(name: String, code: String): String? {
+            val engine = scriptEngine ?: return "Script engine not ready"
+            return engine.saveScript(name, code)
+        }
+
+        override fun deleteScript(name: String): Boolean =
+            scriptEngine?.deleteScript(name) ?: false
+    }
+
+    private val scriptHost = object : ScriptHost {
+        override fun gimbalMove(yawDps: Float, pitchDps: Float) {
+            mainHandler.post { gimbalController?.joystickMove(yawDps, pitchDps) }
+        }
+
+        override fun gimbalStop() {
+            mainHandler.post { gimbalController?.joystickStop() }
+        }
+
+        override fun gimbalCenter() {
+            mainHandler.post { gimbalController?.recenter() }
+        }
+
+        override fun gimbalIsConnected(): Boolean =
+            gimbalController?.state?.value == GimbalController.State.CONNECTED
+
+        override fun gimbalAttitude(): GimbalController.Attitude? = gimbalController?.getAttitude()
+
+        override fun gimbalTrack(x: Float, y: Float): String? =
+            callOnMain { handleTrackAt(x, y) }
+
+        override fun gimbalTrackStop() {
+            mainHandler.post { stopTracking() }
+        }
+
+        override fun gimbalIsTracking(): Boolean = gimbalController?.isTracking == true
+
+        override fun sensorsImu(): FloatArray = gimbalController?.getImu() ?: FloatArray(10)
+
+        override fun detectStart() {
+            mainHandler.post { startDetection() }
+        }
+
+        override fun detectStop() {
+            mainHandler.post { stopDetection() }
+        }
+
+        override fun detectIsRunning(): Boolean = isDetecting.value
+
+        override fun detectObjects(): List<Detection> = detections.value
+
+        override fun streamStart(): Boolean = callOnMain {
+            val success = streamServer?.start() ?: false
+            isCurrentlyStreaming = success
+            success
+        }
+
+        override fun streamStop() {
+            mainHandler.post {
+                streamServer?.stopStreaming()
+                isCurrentlyStreaming = false
+            }
+        }
+
+        override fun streamIsStreaming(): Boolean = streamServer?.isStreaming == true
+
+        override fun recordStart(): Boolean = callOnMain {
+            val server = streamServer ?: return@callOnMain false
+            if (server.isRecording) return@callOnMain true
+            val path = server.startRecording()
+            if (path != null) {
+                lastRecordingUri = server.getLastRecordingUri()
+                lastRecordingName = path.substringAfterLast('/')
+            }
+            path != null
+        }
+
+        override fun recordStop() {
+            mainHandler.post { streamServer?.stopRecording() }
+        }
+
+        override fun recordMark(): Float = callOnMain { streamServer?.addMarker() ?: -1f }
+
+        override fun recordIsRecording(): Boolean = streamServer?.isRecording == true
+
+        override fun onScriptStateChanged(running: Boolean, name: String) {
+            mainHandler.post { scriptRunningName.value = if (running) name else null }
         }
     }
 
@@ -876,6 +1016,8 @@ fun StreamingScreen(
                     isTracking: Boolean = false,
     dockUrl: String? = null,
     dockClients: Int = 0,
+    dockToken: String? = null,
+    scriptName: String? = null,
     onAddMarker: () -> Unit = {},
     onOpenTrimmer: () -> Unit = {},
 ) {
@@ -939,6 +1081,8 @@ fun StreamingScreen(
                     isTracking = isTracking,
                     dockUrl = dockUrl,
                     dockClients = dockClients,
+                    dockToken = dockToken,
+                    scriptName = scriptName,
                 )
             } else {
                 Spacer(Modifier.height(1.dp))
@@ -1046,6 +1190,8 @@ fun StreamInfoBar(
     isTracking: Boolean = false,
     dockUrl: String? = null,
     dockClients: Int = 0,
+    dockToken: String? = null,
+    scriptName: String? = null,
 ) {
     Column(
         modifier = Modifier
@@ -1089,6 +1235,15 @@ fun StreamInfoBar(
                     )
                     Spacer(Modifier.width(12.dp))
                 }
+            }
+            if (scriptName != null) {
+                Text(
+                    text = "Script: $scriptName",
+                    color = Color(0xFF4FC3F7),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Spacer(Modifier.width(12.dp))
             }
             if (isDetecting) {
                 Text(
@@ -1139,6 +1294,20 @@ fun StreamInfoBar(
                     Toast.makeText(context, "URL copied!", Toast.LENGTH_SHORT).show()
                 },
             )
+            if (dockToken != null) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "Token: $dockToken",
+                    color = Color(0xFFFFB74D),
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.clickable {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Dock token", dockToken))
+                        Toast.makeText(context, "Token copied!", Toast.LENGTH_SHORT).show()
+                    },
+                )
+            }
         }
     }
 }

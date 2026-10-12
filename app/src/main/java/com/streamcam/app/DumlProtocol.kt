@@ -1,6 +1,9 @@
 package com.streamcam.app
 
+import android.util.Log
+
 object DumlProtocol {
+    private const val TAG = "DumlProtocol"
     private const val SOF: Byte = 0x55
     private const val VERSION = 1
 
@@ -188,6 +191,53 @@ object DumlProtocol {
 
     private fun hex(s: String): ByteArray = ByteArray(s.length / 2) {
         ((s[it * 2].digitToInt(16) shl 4) or s[it * 2 + 1].digitToInt(16)).toByte()
+    }
+
+    /**
+     * Streaming DUML frame parser for BLE notifications (frames may be fragmented or
+     * concatenated). Scans for SOF, validates the header CRC8 (resyncs on mismatch);
+     * CRC16 is verified but a mismatch only logs — some links differ and the frame is
+     * accepted anyway.
+     */
+    class Parser(private val onFrame: (ByteArray) -> Unit) {
+        private var buf = ByteArray(0)
+
+        fun feed(data: ByteArray) {
+            buf = buf.plus(data)
+            while (true) {
+                val sof = buf.indexOf(SOF)
+                if (sof < 0) {
+                    buf = ByteArray(0)
+                    return
+                }
+                if (sof > 0) buf = buf.copyOfRange(sof, buf.size)
+                if (buf.size < 4) return
+                val len = (buf[1].toInt() and 0xFF) or ((buf[2].toInt() and 0x03) shl 8)
+                if (len < 13 || len > 2048 || (buf[2].toInt() shr 2) != VERSION) {
+                    buf = buf.copyOfRange(1, buf.size)
+                    continue
+                }
+                if (buf.size < len) return
+                if (crc8(buf, 0, 3) != buf[3]) {
+                    buf = buf.copyOfRange(1, buf.size)
+                    continue
+                }
+                val frame = buf.copyOfRange(0, len)
+                val expected = crc16(frame, 0, len - 2)
+                val actual = (frame[len - 2].toInt() and 0xFF) or
+                    ((frame[len - 1].toInt() and 0xFF) shl 8)
+                if (expected != actual) {
+                    Log.d(
+                        TAG,
+                        "CRC16 mismatch (want %04X got %04X) cmdSet=%02X cmd=%02X — accepting anyway".format(
+                            expected, actual, frame[9], frame[10],
+                        ),
+                    )
+                }
+                buf = buf.copyOfRange(len, buf.size)
+                onFrame(frame)
+            }
+        }
     }
 
     fun activeTrackEnable(): ByteArray =

@@ -83,6 +83,47 @@ class GimbalController(private val context: Context) {
     @Volatile private var targetH = 0.2f
     val isTracking get() = trackingActive
 
+    /** Latest attitude push from the gimbal (cmd_set 0x04 / cmd_id 0x05). */
+    data class Attitude(val pitch: Float, val roll: Float, val yaw: Float, val deviceMs: Long)
+
+    @Volatile private var attitude: Attitude? = null
+
+    fun getAttitude(): Attitude? = attitude
+
+    /** Latest phone IMU snapshot: [qw, qx, qy, qz, ax, ay, az, gx, gy, gz]. */
+    fun getImu(): FloatArray = floatArrayOf(
+        imuQw, imuQx, imuQy, imuQz,
+        imuAx, imuAy, imuAz,
+        imuGx, imuGy, imuGz,
+    )
+
+    private val dumlParser = DumlProtocol.Parser { frame -> onDumlFrame(frame) }
+
+    private fun onDumlFrame(frame: ByteArray) {
+        DumlProtocol.ackFor(frame)?.let { ack -> send(ack) }
+        // Attitude push: payload s16 LE x0.1 deg at offsets 0/2/4 (pitch/roll/yaw),
+        // u32 LE device ms clock at offset 12. Payload starts at frame index 11.
+        if (frame.size >= 27 && frame[9] == 0x04.toByte() && frame[10] == 0x05.toByte()) {
+            attitude = Attitude(
+                pitch = s16le(frame, 11) / 10f,
+                roll = s16le(frame, 13) / 10f,
+                yaw = s16le(frame, 15) / 10f,
+                deviceMs = u32le(frame, 23),
+            )
+        }
+    }
+
+    private fun s16le(frame: ByteArray, offset: Int): Int {
+        val v = (frame[offset].toInt() and 0xFF) or ((frame[offset + 1].toInt() and 0xFF) shl 8)
+        return if (v >= 0x8000) v - 0x10000 else v
+    }
+
+    private fun u32le(frame: ByteArray, offset: Int): Long =
+        (frame[offset].toLong() and 0xFF) or
+            ((frame[offset + 1].toLong() and 0xFF) shl 8) or
+            ((frame[offset + 2].toLong() and 0xFF) shl 16) or
+            ((frame[offset + 3].toLong() and 0xFF) shl 24)
+
     val isAvailable: Boolean get() = adapter?.isEnabled == true
 
     companion object {
@@ -535,7 +576,7 @@ class GimbalController(private val context: Context) {
         private fun logNotification(data: ByteArray?) {
             Log.d(TAG, "Notify: ${data?.joinToString("") { "%02X".format(it) }}")
             if (data != null) {
-                DumlProtocol.ackFor(data)?.let { ack -> send(ack) }
+                dumlParser.feed(data)
             }
         }
     }

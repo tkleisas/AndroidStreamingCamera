@@ -10,10 +10,12 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Minimal HTTP/1.1 server hosting the OBS-dockable gimbal control page.
  * Hand-rolled (no HTTP dependency) — thread-per-connection, connections always closed.
- * LAN-only and unauthenticated, same trust model as the RTSP server.
+ * LAN-only, token-authenticated: every route except GET / and POST /api/login requires
+ * a cookie (streamcam_token), Authorization: Bearer, or ?token= matching [authToken].
  */
 class GimbalDockServer(
     private val listener: Listener,
+    private val authToken: String,
     private val port: Int = PORT,
 ) {
 
@@ -28,6 +30,16 @@ class GimbalDockServer(
         fun getDockDetectionsJson(): String
         /** @return the latest preview frame, or null when unavailable (answered as 503) */
         fun getDockPreviewJpeg(): ByteArray?
+        /** @return null if the script was started, otherwise an error message (answered as 409) */
+        fun onScriptRun(code: String?, name: String?): String?
+        fun onScriptStop()
+        fun getScriptStatusJson(): String
+        fun getScriptsJson(): String
+        /** @return the script source, or null if no such script */
+        fun getScriptCode(name: String): String?
+        /** @return null on success, otherwise an error message */
+        fun saveScript(name: String, code: String): String?
+        fun deleteScript(name: String): Boolean
     }
 
     companion object {
@@ -35,10 +47,20 @@ class GimbalDockServer(
         const val PORT = 8556
         private const val CLIENT_WINDOW_MS = 15_000L
         private const val PREVIEW_IDLE_MS = 10_000L
-        private const val MAX_BODY_BYTES = 4096
+        private const val MAX_BODY_BYTES = 256 * 1024
 
-        fun jsonEscape(s: String): String =
-            s.replace("\\", "\\\\").replace("\"", "\\\"")
+        fun jsonEscape(s: String): String = buildString(s.length + 8) {
+            for (c in s) {
+                when (c) {
+                    '\\' -> append("\\\\")
+                    '"' -> append("\\\"")
+                    '\n' -> append("\\n")
+                    '\r' -> append("\\r")
+                    '\t' -> append("\\t")
+                    else -> append(if (c < ' ') ' ' else c)
+                }
+            }
+        }
     }
 
     @Volatile private var running = false
@@ -111,13 +133,20 @@ class GimbalDockServer(
             if (parts.size < 2) return
             val method = parts[0]
             val path = parts[1].substringBefore('?')
+            val query = parts[1].substringAfter('?', "")
 
             var contentLength = 0
+            var cookieHeader: String? = null
+            var authHeader: String? = null
             while (true) {
                 val line = readLine(input) ?: break
                 if (line.isEmpty()) break
                 if (line.startsWith("Content-Length:", ignoreCase = true)) {
                     contentLength = line.substringAfter(':').trim().toIntOrNull() ?: 0
+                } else if (line.startsWith("Cookie:", ignoreCase = true)) {
+                    cookieHeader = line.substringAfter(':').trim()
+                } else if (line.startsWith("Authorization:", ignoreCase = true)) {
+                    authHeader = line.substringAfter(':').trim()
                 }
             }
 
@@ -130,7 +159,7 @@ class GimbalDockServer(
             }
             val body = String(bodyBytes, 0, read, Charsets.UTF_8)
 
-            route(method, path, body, output)
+            route(method, path, query, cookieHeader, authHeader, body, output)
             output.flush()
         } catch (e: Exception) {
             Log.w(TAG, "Connection error: ${e.message}")
@@ -153,12 +182,64 @@ class GimbalDockServer(
         return sb.toString()
     }
 
-    private fun route(method: String, path: String, body: String, out: OutputStream) {
+    private fun isAuthorized(query: String, cookies: String?, authHeader: String?): Boolean {
+        if (authHeader != null &&
+            authHeader.removePrefix("Bearer ").trim() == authToken
+        ) {
+            return true
+        }
+        if (cookies != null) {
+            for (part in cookies.split(';')) {
+                val kv = part.trim()
+                if (kv.startsWith("streamcam_token=") &&
+                    kv.substringAfter('=') == authToken
+                ) {
+                    return true
+                }
+            }
+        }
+        if (query.isNotEmpty()) {
+            for (part in query.split('&')) {
+                if (part.startsWith("token=") && part.substringAfter('=') == authToken) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private fun route(
+        method: String,
+        path: String,
+        query: String,
+        cookies: String?,
+        authHeader: String?,
+        body: String,
+        out: OutputStream,
+    ) {
+        val isPublic = (method == "GET" && (path == "/" || path == "/index.html")) ||
+            (method == "POST" && path == "/api/login")
+        if (!isPublic && !isAuthorized(query, cookies, authHeader)) {
+            respondJson(out, "{\"error\":\"unauthorized\"}", 401, "Unauthorized")
+            return
+        }
         try {
             when {
                 method == "GET" && (path == "/" || path == "/index.html") ->
                     respond(out, 200, "OK", "text/html; charset=utf-8",
                         INDEX_HTML.toByteArray(Charsets.UTF_8))
+
+                method == "POST" && path == "/api/login" -> {
+                    val token = parseJsonString(body, "token")
+                    if (token != null && token == authToken) {
+                        respondJson(
+                            out, "{\"ok\":true}",
+                            extraHeaders = "Set-Cookie: streamcam_token=$authToken; Path=/; SameSite=Lax\r\n",
+                        )
+                    } else {
+                        respondJson(out, "{\"error\":\"invalid token\"}", 401, "Unauthorized")
+                    }
+                }
 
                 method == "GET" && path == "/api/status" ->
                     respondJson(out, listener.getDockStatusJson(recentClients()))
@@ -224,6 +305,71 @@ class GimbalDockServer(
                     respondJson(out, "{\"ok\":true}")
                 }
 
+                method == "POST" && path == "/api/script/run" -> {
+                    val code = parseJsonString(body, "code")
+                    val name = parseJsonString(body, "name")
+                    if (code == null && name == null) {
+                        respondJson(out, "{\"error\":\"need code or name\"}", 400, "Bad Request")
+                    } else {
+                        val err = listener.onScriptRun(code, name)
+                        if (err != null) {
+                            respondJson(out, "{\"error\":\"${jsonEscape(err)}\"}", 409, "Conflict")
+                        } else {
+                            respondJson(out, "{\"ok\":true}")
+                        }
+                    }
+                }
+
+                method == "POST" && path == "/api/script/stop" -> {
+                    listener.onScriptStop()
+                    respondJson(out, "{\"ok\":true}")
+                }
+
+                method == "GET" && path == "/api/script/status" ->
+                    respondJson(out, listener.getScriptStatusJson())
+
+                method == "GET" && path == "/api/scripts" ->
+                    respondJson(out, listener.getScriptsJson())
+
+                path.startsWith("/api/scripts/") -> {
+                    val name = path.removePrefix("/api/scripts/")
+                    if (!ScriptEngine.isValidName(name)) {
+                        respondJson(out, "{\"error\":\"invalid script name\"}", 400, "Bad Request")
+                    } else when (method) {
+                        "GET" -> {
+                            val code = listener.getScriptCode(name)
+                            if (code == null) {
+                                respondJson(out, "{\"error\":\"not found\"}", 404, "Not Found")
+                            } else {
+                                respondJson(out, "{\"name\":\"${jsonEscape(name)}\"," +
+                                    "\"code\":\"${jsonEscape(code)}\"}")
+                            }
+                        }
+                        "POST" -> {
+                            val code = parseJsonString(body, "code")
+                            if (code == null) {
+                                respondJson(out, "{\"error\":\"need code\"}", 400, "Bad Request")
+                            } else {
+                                val err = listener.saveScript(name, code)
+                                if (err != null) {
+                                    respondJson(out, "{\"error\":\"${jsonEscape(err)}\"}",
+                                        400, "Bad Request")
+                                } else {
+                                    respondJson(out, "{\"ok\":true}")
+                                }
+                            }
+                        }
+                        "DELETE" -> {
+                            if (listener.deleteScript(name)) {
+                                respondJson(out, "{\"ok\":true}")
+                            } else {
+                                respondJson(out, "{\"error\":\"not found\"}", 404, "Not Found")
+                            }
+                        }
+                        else -> respondJson(out, "{\"error\":\"not found\"}", 404, "Not Found")
+                    }
+                }
+
                 else -> respondJson(out, "{\"error\":\"not found\"}", 404, "Not Found")
             }
         } catch (e: Exception) {
@@ -237,13 +383,48 @@ class GimbalDockServer(
         return m?.groupValues?.get(1)?.toFloatOrNull()
     }
 
+    /** Extracts a JSON string field, handling standard escape sequences. */
+    private fun parseJsonString(body: String, key: String): String? {
+        val m = Regex("\"" + Regex.escape(key) + "\"\\s*:\\s*\"").find(body) ?: return null
+        var i = m.range.last + 1
+        val sb = StringBuilder()
+        while (i < body.length) {
+            when (val c = body[i]) {
+                '"' -> return sb.toString()
+                '\\' -> {
+                    if (++i >= body.length) return null
+                    when (val e = body[i]) {
+                        '"' -> sb.append('"')
+                        '\\' -> sb.append('\\')
+                        '/' -> sb.append('/')
+                        'n' -> sb.append('\n')
+                        'r' -> sb.append('\r')
+                        't' -> sb.append('\t')
+                        'b' -> sb.append('\b')
+                        'f' -> sb.append('')
+                        'u' -> {
+                            if (i + 4 >= body.length) return null
+                            sb.append(body.substring(i + 1, i + 5).toIntOrNull(16)?.toChar() ?: '?')
+                            i += 4
+                        }
+                        else -> sb.append(e)
+                    }
+                }
+                else -> sb.append(c)
+            }
+            i++
+        }
+        return null
+    }
+
     private fun respondJson(
         out: OutputStream,
         json: String,
         code: Int = 200,
         reason: String = "OK",
+        extraHeaders: String = "",
     ) {
-        respond(out, code, reason, "application/json", json.toByteArray(Charsets.UTF_8))
+        respond(out, code, reason, "application/json", json.toByteArray(Charsets.UTF_8), extraHeaders)
     }
 
     private fun respond(
@@ -252,12 +433,14 @@ class GimbalDockServer(
         reason: String,
         contentType: String,
         body: ByteArray,
+        extraHeaders: String = "",
     ) {
         val head = StringBuilder()
             .append("HTTP/1.1 ").append(code).append(' ').append(reason).append("\r\n")
             .append("Content-Type: ").append(contentType).append("\r\n")
             .append("Content-Length: ").append(body.size).append("\r\n")
             .append("Cache-Control: no-store\r\n")
+            .append(extraHeaders)
             .append("Connection: close\r\n")
             .append("\r\n")
         out.write(head.toString().toByteArray(Charsets.US_ASCII))
@@ -301,9 +484,28 @@ input[type=range]{flex:1}
 #speedv{min-width:52px;text-align:right;color:#9e9ea8}
 #msg{min-height:16px;color:#ffb74d}
 #foot{color:#666;font-size:11px;line-height:1.5}
+#login{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.85);z-index:10}
+#loginbox{background:#1c1c22;border:1px solid #3a3a44;border-radius:10px;padding:20px;display:flex;flex-direction:column;gap:10px;width:260px}
+#loginbox input{background:#26262e;border:1px solid #3a3a44;color:#e8e8ea;border-radius:6px;padding:8px;font-size:13px}
+#loginhint{color:#888;font-size:11px}
+details{border:1px solid #2a2a32;border-radius:8px;padding:6px;display:flex;flex-direction:column;gap:6px}
+summary{cursor:pointer;color:#9e9ea8;margin:-6px;padding:6px}
+select,input[type=text]{background:#26262e;color:#e8e8ea;border:1px solid #3a3a44;border-radius:6px;padding:6px;font-size:12px}
+select{flex:1;min-width:0}
+textarea{width:100%;box-sizing:border-box;background:#0a0a0c;color:#e8e8ea;border:1px solid #3a3a44;border-radius:6px;padding:6px;font:12px/1.4 monospace;resize:vertical}
+#output{background:#0a0a0c;border-radius:6px;padding:6px;max-height:160px;min-height:36px;overflow:auto;font:11px/1.4 monospace;white-space:pre-wrap;color:#9ee09e;margin:0}
+#runstate{color:#4fc3f7;font-size:11px}
 </style>
 </head>
 <body>
+<div id="login">
+  <div id="loginbox">
+    <div><b>Dock token required</b></div>
+    <input id="token" type="password" placeholder="paste token" autocomplete="off">
+    <button id="loginbtn">Log in</button>
+    <div id="loginhint">the token is shown in the StreamCam app under the dock URL</div>
+  </div>
+</div>
 <div id="wrap">
   <div class="row"><span id="dot"></span><span id="devname">gimbal</span><span id="trk">TRACKING</span></div>
   <div id="hint">gimbal not connected — connect it in the StreamCam app</div>
@@ -320,10 +522,29 @@ input[type=range]{flex:1}
   <div class="ctl"><span>speed</span><input id="speed" type="range" min="10" max="120" value="45"><span id="speedv">45&deg;/s</span></div>
   <div class="ctl"><button id="center">Center</button><button id="stoptrk">Stop Track</button></div>
   <div id="msg"></div>
+  <details id="scripts">
+    <summary>Scripts (Lua)</summary>
+    <div class="ctl">
+      <select id="scriptsel"><option value="">(editor draft)</option></select>
+      <button id="refresh" title="Reload list">&#8635;</button>
+    </div>
+    <div class="ctl">
+      <input id="scriptname" type="text" placeholder="script name" style="flex:1">
+      <button id="save">Save</button>
+      <button id="del">Delete</button>
+    </div>
+    <textarea id="code" rows="9" spellcheck="false"></textarea>
+    <div class="ctl">
+      <button id="run">Run</button>
+      <button id="stopbtn">Stop</button>
+      <span id="runstate"></span>
+    </div>
+    <pre id="output"></pre>
+  </details>
   <div id="foot">click the preview to track a detected object &middot; arrows/WASD to move<br>preview needs StreamCam in the foreground &middot; full-motion video is the RTSP Media Source</div>
 </div>
 <script>
-var connected=false, speed=45;
+var connected=false, speed=45, scriptPoll=null;
 var dot=document.getElementById('dot'), devname=document.getElementById('devname'),
     trk=document.getElementById('trk'), hint=document.getElementById('hint'),
     prev=document.getElementById('prev'), prevmsg=document.getElementById('prevmsg'),
@@ -335,22 +556,47 @@ function showMsg(t){
   if(msgTimer) clearTimeout(msgTimer);
   msgTimer=setTimeout(function(){ msg.textContent=''; },3000);
 }
+function showLogin(){ document.getElementById('login').style.display='flex'; }
+function hideLogin(){ document.getElementById('login').style.display='none'; }
+function api(url,opts){
+  return fetch(url,opts||{}).then(function(r){
+    if(r.status===401){ showLogin(); throw new Error('unauthorized'); }
+    return r;
+  });
+}
 function post(url,obj){
-  return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})})
+  return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj||{})})
     .then(function(r){
       if(!r.ok){
-        return r.json().then(function(j){ showMsg(j.error||('error '+r.status)); })
+        r.json().then(function(j){ showMsg(j.error||('error '+r.status)); })
           .catch(function(){ showMsg('error '+r.status); });
+        return null;
+      }
+      return r;
+    })
+    .catch(function(e){ if(e.message!=='unauthorized') showMsg('request failed'); return null; });
+}
+document.getElementById('loginbtn').addEventListener('click',function(){
+  var t=document.getElementById('token').value;
+  fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})})
+    .then(function(r){
+      if(r.ok){
+        hideLogin(); pollStatus(); pollPreview(); refreshScripts(); pollScript();
+      } else {
+        document.getElementById('loginhint').textContent='wrong token — check the StreamCam app';
       }
     })
-    .catch(function(){ showMsg('request failed'); });
-}
+    .catch(function(){ document.getElementById('loginhint').textContent='login request failed'; });
+});
+document.getElementById('token').addEventListener('keydown',function(e){
+  if(e.key==='Enter') document.getElementById('loginbtn').click();
+});
 function setEnabled(en){
-  var bs=document.querySelectorAll('button');
+  var bs=document.querySelectorAll('#pad button, #center, #stoptrk');
   for(var i=0;i<bs.length;i++) bs[i].disabled=!en;
 }
 function pollStatus(){
-  fetch('/api/status').then(function(r){ return r.json(); }).then(function(s){
+  api('/api/status').then(function(r){ return r.json(); }).then(function(s){
     connected = s.gimbal==='CONNECTED';
     dot.style.background = connected ? '#66bb6a' : (s.gimbal==='DISCONNECTED' ? '#777' : '#ffeb3b');
     devname.textContent = s.deviceName || ('gimbal: '+String(s.gimbal).toLowerCase());
@@ -363,7 +609,7 @@ function pollPreview(){ prev.src='/preview.jpg?t='+Date.now(); }
 prev.onload=function(){ prevmsg.style.display='none'; };
 prev.onerror=function(){ prevmsg.style.display='flex'; };
 function pollDetections(){
-  fetch('/api/detections').then(function(r){ return r.json(); }).then(function(j){
+  api('/api/detections').then(function(r){ return r.json(); }).then(function(j){
     var html='';
     for(var i=0;i<j.boxes.length;i++){
       var b=j.boxes[i];
@@ -430,9 +676,74 @@ document.addEventListener('keyup',function(e){
   delete keys[String(e.key).toLowerCase()];
   applyKeys();
 });
+
+// --- Scripts panel ---
+var codeEl=document.getElementById('code'), selEl=document.getElementById('scriptsel'),
+    nameEl=document.getElementById('scriptname'), outEl=document.getElementById('output'),
+    runstateEl=document.getElementById('runstate');
+var draft=null;
+try{ draft=localStorage.getItem('script_draft'); }catch(e){}
+if(draft!==null&&draft!==undefined) codeEl.value=draft;
+codeEl.addEventListener('input',function(){
+  try{ localStorage.setItem('script_draft',codeEl.value); }catch(e){}
+});
+function refreshScripts(){
+  api('/api/scripts').then(function(r){ return r.json(); }).then(function(list){
+    var html='<option value="">(editor draft)</option>';
+    for(var i=0;i<list.length;i++) html+='<option value="'+list[i]+'">'+list[i]+'</option>';
+    selEl.innerHTML=html;
+  }).catch(function(){});
+}
+document.getElementById('refresh').addEventListener('click',refreshScripts);
+selEl.addEventListener('change',function(){
+  var n=selEl.value;
+  nameEl.value=n;
+  if(!n) return;
+  api('/api/scripts/'+encodeURIComponent(n)).then(function(r){ return r.json(); }).then(function(j){
+    codeEl.value=j.code;
+    try{ localStorage.setItem('script_draft',j.code); }catch(e){}
+  }).catch(function(){});
+});
+document.getElementById('save').addEventListener('click',function(){
+  var n=nameEl.value.trim();
+  if(!n){ showMsg('name the script first'); return; }
+  post('/api/scripts/'+encodeURIComponent(n),{code:codeEl.value}).then(function(r){
+    if(r){ showMsg('saved '+n); refreshScripts(); }
+  });
+});
+document.getElementById('del').addEventListener('click',function(){
+  var n=nameEl.value.replace(/^\s+|\s+$/g,'');
+  if(!n){ showMsg('pick a script to delete'); return; }
+  api('/api/scripts/'+encodeURIComponent(n),{method:'DELETE'}).then(function(r){
+    if(r.ok){ showMsg('deleted '+n); refreshScripts(); } else { showMsg('delete failed'); }
+  }).catch(function(){});
+});
+document.getElementById('run').addEventListener('click',function(){
+  post('/api/script/run',{code:codeEl.value}).then(function(r){
+    if(r){ pollScript(); }
+  });
+});
+document.getElementById('stopbtn').addEventListener('click',function(){
+  post('/api/script/stop');
+});
+function pollScript(){
+  api('/api/script/status').then(function(r){ return r.json(); }).then(function(s){
+    runstateEl.textContent = s.running ? ('running: '+s.name) : '';
+    outEl.textContent = s.output;
+    outEl.scrollTop = outEl.scrollHeight;
+    if(s.running){
+      if(!scriptPoll) scriptPoll=setInterval(pollScript,1000);
+    } else if(scriptPoll){
+      clearInterval(scriptPoll);
+      scriptPoll=null;
+    }
+  }).catch(function(){});
+}
+
 pollStatus(); setInterval(pollStatus,1000);
 pollPreview(); setInterval(pollPreview,250);
 pollDetections(); setInterval(pollDetections,300);
+refreshScripts(); pollScript();
 </script>
 </body>
 </html>

@@ -97,16 +97,13 @@ Then connect to `rtsp://localhost:8554/` instead.
 Protocol details and the full reverse-engineering write-up: `OM7_BLE_PROTOCOL.md`,
 `docs/MIMO_NATIVE_ANALYSIS.md`, `docs/dji_cmd_base_req_table.txt`.
 
-### Object Detection and Gimbal Tracking *(currently disabled)*
+### Object Detection and Gimbal Tracking
 
-YOLO v8 detection + ActiveTrack are implemented but **disabled in current builds**: the ONNX
-model is not bundled in the repo. Without it the Detect button is hidden and click-to-track in
-the dock is unavailable. Manual gimbal control (joystick, recenter) works regardless.
-
-To re-enable later: run `export_yolo_model.py`, place the resulting `.onnx` in
-`app/src/main/assets/`, then tap **Detect** and tap a bounding box to track it. (Note: the
-gimbal's own ActiveTrack path — `0x23/0x09` box streaming — is implemented and was
-hardware-verified; only the model is missing.)
+- Tap **Detect** to start YOLO v8 object detection, tap a bounding box to ActiveTrack it
+- Requires `app/src/main/assets/yolov8n.onnx` — a generated artifact that is **gitignored**
+  (`*.onnx`). If missing (fresh clone), regenerate it with `pip install ultralytics` +
+  `python export_yolo_model.py` and rebuild; without the model the Detect button is hidden
+  and click-to-track is unavailable, but everything else works
 
 ### OBS integration
 
@@ -117,18 +114,60 @@ for gimbal control, designed to be docked inside OBS Studio:
 
 1. In OBS: **View → Docks → Custom Browser Docks…**
 2. Name it `Gimbal`, URL `http://PHONE_IP:8556/` (the URL is shown in the app's status bar while streaming)
+3. First visit shows a **login prompt** — paste the **dock token** shown in the app's status
+   bar (next to the dock URL; tap to copy). A cookie keeps the dock logged in afterwards.
 
 The dock page offers:
 
-- **Live preview** (~4 fps JPEG) with detection boxes overlaid — click a box to start ActiveTrack, click again to stop *(requires the YOLO model — currently disabled)*
+- **Live preview** (~4 fps JPEG) with detection boxes overlaid — click a box to start ActiveTrack, click again to stop
 - **D-pad** pan/tilt (press-and-hold) plus arrow/WASD keys
 - **Speed slider** (10–120 °/s), **Center** and **Stop Track** buttons
+- **Scripts panel** — edit, save, and run Lua scripts on the phone (see below)
 
 Notes:
 
 - Full-motion video still comes from the RTSP Media Source (`rtsp://PHONE_IP:8554/`); the dock is control + a low-fps preview only
 - The preview requires the StreamCam app to be in the foreground (frames are captured from the camera preview view); otherwise the dock shows "preview unavailable"
-- The dock server is **LAN-only and unauthenticated** — same trust model as the RTSP server. Don't expose it beyond your local network
+- The dock API is **token-authenticated** (cookie, `Authorization: Bearer <token>`, or
+  `?token=` query) but still **LAN-only** — don't expose it beyond your local network
+
+### Lua scripting
+
+The dock's **Scripts** panel runs sandboxed Lua (LuaJ) on the phone — one script at a time,
+with the gimbal always zeroed when a script ends or is stopped. Named scripts are stored on
+the phone (`filesDir/scripts/<name>.lua`) and survive restarts; the API is also reachable
+directly: `POST /api/script/run {code|name}`, `POST /api/script/stop`,
+`GET /api/script/status`, `GET/POST/DELETE /api/scripts/<name>`.
+
+Available API:
+
+| Lua | Effect |
+|---|---|
+| `gimbal.move(yawDps, pitchDps)` / `gimbal.stop()` / `gimbal.center()` | velocity move (±120 °/s) / stop / recenter |
+| `gimbal.is_connected()` | gimbal BLE state |
+| `gimbal.attitude()` | `{pitch, roll, yaw, ms}` from gimbal telemetry (nil until connected) |
+| `gimbal.track(x, y)` / `gimbal.track_stop()` / `gimbal.is_tracking()` | ActiveTrack at normalized point (auto-starts detection) |
+| `sensors.imu()` | `{quat={w,x,y,z}, accel={x,y,z}, gyro={x,y,z}}` phone IMU |
+| `detect.start()` / `detect.stop()` / `detect.is_running()` | YOLO detection control |
+| `detect.objects()` | array of `{x, y, w, h, label, conf}` (normalized) |
+| `stream.start()` / `stream.stop()` / `stream.is_streaming()` | RTSP stream control |
+| `record.start()` / `record.stop()` / `record.mark()` / `record.is_recording()` | recording control + marker stamps |
+| `sleep(ms)`, `print(...)` | engine built-ins (`print` goes to the dock console) |
+
+Example — slow scan while tracking whatever is centered:
+
+```lua
+detect.start()
+sleep(2000)
+print(#detect.objects(), "objects")
+gimbal.move(30, 0)   -- pan right at 30 deg/s
+sleep(3000)
+gimbal.stop()
+gimbal.center()
+print("yaw now:", gimbal.attitude() and gimbal.attitude().yaw)
+```
+
+Sandbox: no `io`, `os`, `debug`, or Java interop; `Stop` kills even infinite loops.
 
 ## Tech Stack
 

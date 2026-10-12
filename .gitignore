@@ -26,3 +26,4 @@ bugreport.zip
 
 # Local agent state
 .claude/
+*.onnx
